@@ -13,16 +13,17 @@ import time
 import traceback
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TypedDict
+import threading
+from typing import Annotated, TypedDict
 
 from core import DecisionRecord
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command, interrupt
+from langgraph.types import Command, Send, interrupt
 
 from engines import Engine
 
-from . import stages
+from . import multi_analysis, stages
 from .machine import STAGE_FILES, transition
 from .locks import file_lock
 from .runner import engine_of, new_run
@@ -31,6 +32,15 @@ from .store import RunStore
 
 CHECKPOINT_DB = "checkpoints.sqlite"
 CHAMPION_FILE = "champion_params.json"     # 실행 시작 시점의 챔피언 params (재개해도 같은 기준으로 평가)
+
+
+def perspective_file(perspective_id: str) -> str:
+    return f"2_analyze.{perspective_id}.json"
+
+
+def _merge(left: dict | None, right: dict | None) -> dict:
+    """병렬 관점 노드의 결과를 합치는 리듀서."""
+    return {**(left or {}), **(right or {})}
 
 
 class WorkflowState(TypedDict, total=False):
@@ -44,6 +54,8 @@ class WorkflowState(TypedDict, total=False):
     proposals: dict             # 개선안 id·허용 범위 검사 결과 + 파일
     validation: dict            # 승인 후보 + 파일
     decision: dict              # 사람(또는 워크플로우)의 승인·반려
+    analysis_mode: str          # single | multi (X2)
+    perspectives: Annotated[dict, _merge]   # 관점 id → 요약 (병렬 노드가 각자 씀)
     retry_count: int
     max_retries: int
     errors: list
@@ -57,6 +69,7 @@ class Deps:
         self.llm = llm
         self.llm_config = llm_config or {}
         self._cache: dict[str, tuple] = {}
+        self._lock = threading.Lock()          # 관점 노드가 병렬로 instance를 찾을 때
 
     def run(self, run_id: str) -> dict:
         return self.store.load(run_id)
@@ -69,11 +82,12 @@ class Deps:
 
     def instance(self, run_id: str):
         """시나리오 인스턴스 (결정적 재생성, 프로세스 안에서만 캐시)."""
-        if run_id not in self._cache:
-            run = self.run(run_id)
-            pack = self.engine(run_id).pack_factory(self.champion(run_id))
-            self._cache[run_id] = pack.generate(run["scenario"]["seed"], run["scenario"]["faults"])
-        return self._cache[run_id][0]
+        with self._lock:
+            if run_id not in self._cache:
+                run = self.run(run_id)
+                pack = self.engine(run_id).pack_factory(self.champion(run_id))
+                self._cache[run_id] = pack.generate(run["scenario"]["seed"], run["scenario"]["faults"])
+            return self._cache[run_id][0]
 
     def decisions(self, run_id: str) -> list[DecisionRecord]:
         return [DecisionRecord(**d) for d in self.store.read(run_id, "decisions.json")]
@@ -128,6 +142,37 @@ def build_graph(deps: Deps):
         status = deps.advance(run_id, "analyzed", f"발견 {len(report['findings'])}건")
         return {"status": status, "analysis": {"findings": [f"{f['id']} {f['title']}" for f in report["findings"]],
                                                 "file": STAGE_FILES["2_analyze"]}}
+
+    # --- 2단계 멀티에이전트 (X2): 관점 노드 N개 병렬 → 종합 ---------------------------
+
+    def perspective(task: dict) -> dict:
+        """Send로 관점마다 한 번씩 병렬 실행된다. 실패해도 실행을 failed로 만들지 않고 결과에 남긴다 (종합이 판단)."""
+        run_id, p = task["run_id"], task["perspective"]
+        try:
+            engine, params = deps.engine(run_id), deps.champion(run_id)
+            result = multi_analysis.run_perspective(engine.pack_factory(params), deps.instance(run_id),
+                                                    deps.decisions(run_id), p, deps.llm, deps.llm_config,
+                                                    deps.run(run_id)["limits"]["perspective_max_llm_calls"])
+        except Exception as exc:  # noqa: BLE001
+            result = {"perspective": p["id"], "name": p["name"], "error": f"{type(exc).__name__}: {exc}"}
+        store.write(run_id, perspective_file(p["id"]), result)
+        return {"perspectives": {p["id"]: {"file": perspective_file(p["id"]), "error": result.get("error"),
+                                           "findings": len(result.get("findings", []))}}}
+
+    def synthesize(state: WorkflowState) -> dict:
+        run_id = state["run_id"]
+        results = {pid: store.read(run_id, info["file"]) for pid, info in state["perspectives"].items()}
+        engine, params = deps.engine(run_id), deps.champion(run_id)
+        report = stages.check_report(multi_analysis.synthesize(
+            engine.pack_factory(params), deps.instance(run_id), deps.decisions(run_id), results, deps.llm,
+            deps.llm_config, deps.run(run_id)["limits"]["synthesis_max_llm_calls"]))
+        store.write(run_id, STAGE_FILES["2_analyze"], report)
+        failed = [pid for pid, r in results.items() if "error" in r]
+        note = f"발견 {len(report['findings'])}건 (관점 {len(results) - len(failed)}/{len(results)})" + (
+            f", 실패 관점 {failed}" if failed else "")
+        status = deps.advance(run_id, "analyzed", note)
+        return {"status": status, "analysis": {"findings": [f"{f['id']} {f['title']}" for f in report["findings"]],
+                                                "file": STAGE_FILES["2_analyze"], "mode": "multi"}}
 
     def propose(state: WorkflowState) -> dict:
         run_id, attempt = state["run_id"], state.get("retry_count", 0)
@@ -212,6 +257,15 @@ def build_graph(deps: Deps):
 
     # --- 그래프 -------------------------------------------------------------------
 
+    def route_analysis(s: WorkflowState):
+        if s.get("status") == "failed":
+            return END
+        if s.get("analysis_mode") != "multi":
+            return "analyze"
+        run_id = s["run_id"]
+        return [Send("perspective", {"run_id": run_id, "perspective": p})
+                for p in deps.run(run_id)["analysis"]["perspectives"]]
+
     def ok(next_node: str):
         return lambda s: END if s.get("status") == "failed" else next_node
 
@@ -226,11 +280,15 @@ def build_graph(deps: Deps):
         return "apply" if s["decision"]["decision"] == "approved" else "reject"
 
     g = StateGraph(WorkflowState)
-    for fn in (execute, analyze, propose, validate, retry, auto_reject, await_approval, approval, apply, reject):
-        g.add_node(fn.__name__, _guarded(deps, fn) if fn is not approval else fn)
+    for fn in (execute, analyze, synthesize, propose, validate, retry, auto_reject, await_approval, apply, reject):
+        g.add_node(fn.__name__, _guarded(deps, fn))
+    g.add_node("perspective", perspective)      # 실패를 스스로 기록한다 (병렬이라 상태 전이는 종합 노드만)
+    g.add_node("approval", approval)            # interrupt만 한다
     g.add_edge(START, "execute")
-    g.add_conditional_edges("execute", ok("analyze"), ["analyze", END])
+    g.add_conditional_edges("execute", route_analysis, ["analyze", "perspective", END])
+    g.add_edge("perspective", "synthesize")     # 모든 관점이 끝난 뒤 한 번 실행된다
     g.add_conditional_edges("analyze", ok("propose"), ["propose", END])
+    g.add_conditional_edges("synthesize", ok("propose"), ["propose", END])
     g.add_conditional_edges("propose", ok("validate"), ["validate", END])
     g.add_conditional_edges("validate", after_validate, ["await_approval", "retry", "auto_reject", END])
     g.add_conditional_edges("retry", ok("propose"), ["propose", END])
@@ -264,18 +322,30 @@ def mermaid() -> str:
 # --- 공개 함수 (CLI) ------------------------------------------------------------------
 
 def run_workflow(store: RunStore, engine: Engine, *, seed: int, faults: list[str], llm, llm_config: dict,
-                 limits: dict, rehearsal: bool) -> dict:
+                 limits: dict, rehearsal: bool, analysis_mode: str = "single",
+                 perspectives: list[dict] | None = None, stop_before: list[str] | None = None) -> dict:
     """1~4단계를 돌고 승인 대기(interrupt)에서 멈춘다. 승인 후보가 없으면 재시도 후 자동 반려(rejected),
-    노드 실패 시 failed로 끝난다. 최종 run(run.json)을 돌려준다."""
+    노드 실패 시 failed로 끝난다. 최종 run(run.json)을 돌려준다.
+
+    analysis_mode="multi"면 perspectives(관점 정의)로 멀티에이전트 분석을 한다. 정의는 run.json에 복사된다.
+    stop_before: 이 노드들 앞에서 멈춘다 (분석 방식 비교 평가처럼 일부 단계만 돌릴 때).
+    """
+    if analysis_mode not in ("single", "multi"):
+        raise ValueError(f"알 수 없는 분석 방식: {analysis_mode}")
+    if analysis_mode == "multi" and not perspectives:
+        raise ValueError("멀티에이전트 분석에는 관점 정의가 필요하다")
     run = new_run(store, engine, seed=seed, faults=faults, llm_model=llm.model, llm_config=llm_config,
                   limits=limits, rehearsal=rehearsal, orchestrator="langgraph")
+    run["analysis"] = {"mode": analysis_mode, **({"perspectives": perspectives} if analysis_mode == "multi" else {})}
+    store.save(run)
     store.write(run["run_id"], CHAMPION_FILE, engine.load_params())
     deps = Deps(store, llm, llm_config)
     state: WorkflowState = {"run_id": run["run_id"], "status": "running", "engine": engine.name,
                             "model_version": run["model_version"], "scenario_set": run["scenario"],
+                            "analysis_mode": analysis_mode, "perspectives": {},
                             "retry_count": 0, "max_retries": int(limits.get("max_retries", 0)), "errors": []}
     with compiled(deps) as graph:
-        graph.invoke(state, _config(run["run_id"]))
+        graph.invoke(state, _config(run["run_id"]), interrupt_before=stop_before)
     return store.load(run["run_id"])
 
 

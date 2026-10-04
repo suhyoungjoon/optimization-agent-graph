@@ -49,6 +49,11 @@ def execute(engine: Engine, params: dict, seed: int, faults: list[str]):
 
 def analyze(engine: Engine, params: dict, instance, decisions, llm, llm_config: dict, max_calls: int) -> dict:
     report = core_analyze(engine.pack_factory(params), instance, decisions, llm, llm_config, max_calls=max_calls)
+    return check_report(report)
+
+
+def check_report(report: dict) -> dict:
+    """단일·멀티 분석 리포트 공통: 제출되지 않았거나 근거 있는 발견이 없으면 진행할 수 없다."""
     if report["stop"] != "submitted":
         raise StageError(f"분석 agent가 리포트를 제출하지 않음 (stop={report['stop']})")
     if not report["findings"]:

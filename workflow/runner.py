@@ -166,8 +166,10 @@ def summary(store: RunStore, run_id: str) -> dict:
         out["execute"] = {k: ex[k] for k in ("items", "metrics", "violations", "reason_counts")}
     if store.has(run_id, STAGE_FILES["2_analyze"]):
         an = store.read(run_id, STAGE_FILES["2_analyze"])
-        out["analyze"] = {"findings": [f"{f['id']} {f['title']}" for f in an["findings"]],
-                          "dropped": len(an["dropped"]), "usage": an["usage"]}
+        out["analyze"] = {"mode": an.get("mode", "single"),
+                          "findings": [f"{f['id']} {f['title']}" for f in an["findings"]],
+                          "dropped": len(an["dropped"]), "usage": an["usage"],
+                          "perspectives": an.get("perspectives", {})}
     if store.has(run_id, STAGE_FILES["3_propose"]):
         pr = store.read(run_id, STAGE_FILES["3_propose"])
         out["propose"] = [{"id": p["id"], "title": p["proposal"].get("title"), "errors": p["errors"]}

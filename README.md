@@ -12,6 +12,8 @@ pytest
 python -m workflow run --rehearsal       # API 키 없이 가짜 LLM으로 승인 대기까지
 python -m workflow approve <run_id>      # 체크포인트에서 재개해 params version +1
 python -m workflow graph                 # 그래프를 Mermaid로 출력
+python -m workflow run --analysis multi --rehearsal   # 멀티에이전트 분석
+python -m workflow compare-analysis --rehearsal       # 단일 대 멀티 분석 비교
 ```
 
 실행 결과는 `runs/<run_id>/`에 단계별 JSON(`1_execute.json` … `5_apply.json`)으로 남는다.

@@ -71,7 +71,10 @@ python -m workflow status [<run_id>]                     # 실행 목록 / 단�
 python -m workflow approve <run_id> [--proposal C1]      # 사람 승인 → params version +1
 python -m workflow reject <run_id> --note "사유"          # 사람 반려 (기록만)
 python -m workflow graph [--out <파일>]                   # 워크플로우 그래프를 Mermaid로 내보냄
+python -m workflow run --analysis multi --rehearsal      # 멀티에이전트 분석 (관점 agent 4개 + 종합)
+python -m workflow compare-analysis --rehearsal          # 단일 대 멀티 분석 비교 (분석 단계까지만, runs/evals/)
 ```
+X2: 결과분석 방식은 `settings/workflow.yaml`의 `analysis_mode`(기본 single) 또는 `--analysis`로 고른다. 관점 agent 정의(관점·도구)는 `settings/analysis.yaml`이며 실행마다 `run.json`에 복사된다. 리허설 비교 수치는 가짜 LLM 각본이므로 품질 근거로 쓰지 않는다.
 X1부터 `run`은 LangGraph 그래프(`workflow/graph.py`)로 돈다. 승인 대기는 interrupt이고, 체크포인트는 `runs/checkpoints.sqlite`(thread_id = run_id)에 남는다. `approve`·`reject`는 다른 프로세스에서 같은 실행을 재개한다. 단계 결과의 기준은 여전히 `runs/<run_id>/`의 JSON 파일이다.
 `workflow/runner.py`(M1 상태 머신)는 동등성 테스트의 기준으로 남아 있다.
 M1에서는 시나리오를 `--seed`·`--faults`(기본값 `settings/workflow.yaml`)로 지정한다. `--scenario train`(시나리오 세트)은 M2.

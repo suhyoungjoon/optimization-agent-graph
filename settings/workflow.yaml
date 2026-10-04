@@ -1,7 +1,9 @@
 # 워크플로우 설정. 상한·기본값은 코드가 아니라 이 파일에서 읽는다.
-# M1·X1 범위: 단계별 LLM 호출 상한, 재시도 상한, 기본 시나리오(단일 seed). 판정 기준·시나리오 세트는 M2.
+# M1·X1·X2 범위: 분석 방식, 단계별 LLM 호출 상한, 재시도 상한, 기본 시나리오(단일 seed). 판정 기준·시나리오 세트는 M2.
 
 engine: rule
+
+analysis_mode: single    # single: 단일 분석 agent | multi: 관점 agent 4개 + 종합 (X2, settings/analysis.yaml). CLI --analysis가 우선
 
 scenario:                 # 1단계 실행에 쓰는 시나리오 (CLI --seed, --faults가 우선)
   seed: 42
@@ -10,4 +12,6 @@ scenario:                 # 1단계 실행에 쓰는 시나리오 (CLI --seed, -
 limits:
   analyze_max_llm_calls: 30   # 2단계 분석 agent의 도구 루프 상한 (코어 analyze max_calls)
   propose_max_llm_calls: 20   # 3단계 개선 agent의 도구 루프 상한 (코어 propose max_calls)
+  perspective_max_llm_calls: 15   # 멀티에이전트 분석: 관점 agent 하나의 도구 루프 상한
+  synthesis_max_llm_calls: 3      # 멀티에이전트 분석: 종합 agent의 상한 (도구 없이 제출·수정만)
   max_retries: 1              # 4단계 검증에서 승인 후보가 없을 때 3단계로 되돌리는 횟수 상한 (X1 그래프)

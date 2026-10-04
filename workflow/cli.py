@@ -1,10 +1,11 @@
 """워크플로우 CLI.
 
-    python -m workflow run [--engine rule] [--params PATH] [--seed N] [--faults P1,P2] [--rehearsal]
+    python -m workflow run [--engine rule] [--params PATH] [--seed N] [--faults P1,P2] [--analysis multi] [--rehearsal]
     python -m workflow approve <run_id> [--proposal C1] [--note "..."]
     python -m workflow reject <run_id> [--note "..."]
     python -m workflow status [<run_id>]
     python -m workflow graph [--out workflow-graph.mmd]
+    python -m workflow compare-analysis [--seed N] [--faults ...] [--rehearsal]
 
 경로 기본값은 이 레포 기준이다 (runs/, settings/). 코어에는 경로를 항상 인자로 넘긴다.
 """
@@ -18,7 +19,7 @@ import yaml
 
 from engines import get_engine
 
-from . import graph, runner
+from . import evaluation, graph, multi_analysis, runner
 from .store import RunStore
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -57,8 +58,12 @@ def _print_summary(info: dict) -> None:
         print(f"  [1 실행] {ex['items']}건, 위반 {ex['violations']}건, 실패 사유 {ex['reason_counts']}")
         print(f"           {metrics}")
     if an := info.get("analyze"):
-        print(f"  [2 결과분석] 발견 {len(an['findings'])}건 (근거 없음으로 제외 {an['dropped']}건): "
+        mode = "멀티에이전트" if an["mode"] == "multi" else "단일"
+        print(f"  [2 결과분석·{mode}] 발견 {len(an['findings'])}건 (근거 없음으로 제외 {an['dropped']}건): "
               + "; ".join(an["findings"]))
+        for pid, pr in an["perspectives"].items():
+            detail = f"실패: {pr['error']}" if pr.get("error") else "; ".join(pr["findings"]) or "발견 없음"
+            print(f"           관점 {pr.get('name') or pid}: {detail}")
     for p in info.get("propose", []):
         state = "허용 범위 통과" if not p["errors"] else "제외: " + "; ".join(p["errors"])
         print(f"  [3 개선안] {p['id']} {p['title']} — {state}")
@@ -79,6 +84,28 @@ def _print_summary(info: dict) -> None:
         print(f"  다음: python -m workflow approve {info['run_id']}  또는  reject {info['run_id']} --note '사유'")
 
 
+def _print_comparison(c: dict) -> None:
+    print(f"분석 방식 비교 [{c['label']}]  엔진={c['engine']}  seed {c['scenario']['seed']} "
+          f"{','.join(c['scenario']['faults']) or '결함 없음'}  LLM={c['llm_model']}  ({c['eval_id']})")
+    faults = sorted(next((r["faults"] for r in c["results"].values() if "faults" in r), {}))
+    print(f"  {'방식':8s} {'탐지':6s} " + " ".join(f"{f:3s}" for f in faults)
+          + "  오탐후보  LLM호출  입력토큰  출력토큰  비용(USD)  분석시간(s)")
+    for mode, r in c["results"].items():
+        if "error" in r:
+            print(f"  {mode:8s} 실패: {r['status']} {r['error'] and r['error']['message']}")
+            continue
+        marks = " ".join(f"{'O' if r['faults'][f]['detected'] else 'X':3s}" for f in faults)
+        cost = "-" if r["cost_usd"] is None else f"{r['cost_usd']:.4f}"
+        print(f"  {mode:8s} {r['detected']}/{r['total']:<4} {marks}  {len(r['false_positive_candidates']):8d}  "
+              f"{r['llm_calls']:7d}  {r['tokens']['input_tokens']:8d}  {r['tokens']['output_tokens']:8d}  "
+              f"{cost:>9s}  {r['analysis_seconds']:10.2f}")
+    for mode, r in c["results"].items():
+        for fp in r.get("false_positive_candidates", []):
+            print(f"  오탐 후보 ({mode}) {fp['id']} {fp['title']} — 사람이 정당한 발견/오탐을 판정")
+    if c["rehearsal"]:
+        print("  주의: 리허설 수치는 가짜 LLM 각본대로 나온 값이다. 파이프라인 확인용이며 품질 비교는 실제 API로 한다.")
+
+
 def _orchestrator(store: RunStore, run_id: str):
     """X1 이전(M1 러너)으로 만든 실행은 체크포인트가 없으므로 M1 방식으로 승인·반려한다."""
     return graph if store.load(run_id).get("orchestrator") == "langgraph" else runner
@@ -96,7 +123,17 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--seed", type=int)
     p_run.add_argument("--faults", help="쉼표로 구분. 빈 문자열이면 결함 없음")
     p_run.add_argument("--rehearsal", action="store_true", help="가짜 LLM으로 실행 (API 키 불필요)")
+    p_run.add_argument("--analysis", choices=["single", "multi"],
+                       help="결과분석 방식 (기본값: settings/workflow.yaml의 analysis_mode)")
     p_run.add_argument("--json", action="store_true")
+
+    p_cmp = sub.add_parser("compare-analysis", help="같은 시나리오로 단일 분석 대 멀티에이전트 분석 비교 (분석 단계까지만)")
+    p_cmp.add_argument("--engine")
+    p_cmp.add_argument("--params", type=Path)
+    p_cmp.add_argument("--seed", type=int)
+    p_cmp.add_argument("--faults")
+    p_cmp.add_argument("--rehearsal", action="store_true")
+    p_cmp.add_argument("--json", action="store_true")
 
     p_ok = sub.add_parser("approve", help="사람 승인: 후보를 params에 반영하고 버전을 올린다")
     p_ok.add_argument("run_id")
@@ -118,16 +155,31 @@ def main(argv: list[str] | None = None) -> int:
     store = RunStore(args.runs_dir)
 
     try:
-        if args.command == "run":
+        if args.command in ("run", "compare-analysis"):
             settings = _settings(args.settings_dir)
             name = args.engine or settings["engine"]
             engine = get_engine(name, args.params)
             seed = args.seed if args.seed is not None else settings["scenario"]["seed"]
             faults = ([f for f in args.faults.split(",") if f] if args.faults is not None
                       else list(settings["scenario"]["faults"]))
+            perspectives = multi_analysis.load_perspectives(args.settings_dir / "analysis.yaml")
+        if args.command == "compare-analysis":
+            llm_config = _make_llm(args.settings_dir, args.runs_dir, args.rehearsal)[1]
+            comparison = evaluation.compare_analysis(
+                args.runs_dir / "evals", engine, seed=seed, faults=faults, llm_config=llm_config,
+                llm_factory=lambda: _make_llm(args.settings_dir, args.runs_dir, args.rehearsal)[0],
+                limits=settings["limits"], perspectives=perspectives, rehearsal=args.rehearsal)
+            if args.json:
+                print(json.dumps(comparison, ensure_ascii=False, indent=1))
+            else:
+                _print_comparison(comparison)
+            return 0 if all("error" not in r for r in comparison["results"].values()) else 1
+        if args.command == "run":
+            mode = args.analysis or settings.get("analysis_mode", "single")
             llm, llm_config = _make_llm(args.settings_dir, args.runs_dir, args.rehearsal)
             run = graph.run_workflow(store, engine, seed=seed, faults=faults, llm=llm, llm_config=llm_config,
-                                      limits=settings["limits"], rehearsal=args.rehearsal)
+                                     limits=settings["limits"], rehearsal=args.rehearsal, analysis_mode=mode,
+                                     perspectives=perspectives if mode == "multi" else None)
             run_id = run["run_id"]
         elif args.command == "approve":
             run_id = _orchestrator(store, args.run_id).approve(store, args.run_id, args.proposal, args.note)["run_id"]
