@@ -118,6 +118,32 @@ def _guarded(deps: Deps, fn):
     return node
 
 
+def _timed(deps: Deps, name: str, fn):
+    """노드 시작·종료 시각을 timings/에 남긴다 (통계·병렬 가지 표시용). 관점 노드는 관점 id를 task로 남긴다."""
+    def node(arg: dict) -> dict:
+        started = time.time()
+        error = None
+        try:
+            out = fn(arg)
+            if isinstance(out, dict) and out.get("status") == "failed":
+                error = (out.get("errors") or [{}])[-1].get("message")
+            return out
+        except BaseException as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            finished = time.time()
+            task = (arg.get("perspective") or {}).get("id") if name == "perspective" else None
+            try:
+                deps.store.record_timing(arg["run_id"], {"node": name, "task": task, "started_at": started,
+                                                         "finished_at": finished, "seconds": finished - started,
+                                                         "error": error})
+            except OSError:
+                pass                                      # 기록 실패가 실행을 막지 않게 한다
+    node.__name__ = name
+    return node
+
+
 def build_graph(deps: Deps):
     store = deps.store
 
@@ -307,8 +333,8 @@ def build_graph(deps: Deps):
 
     g = StateGraph(WorkflowState)
     for fn in (execute, analyze, synthesize, propose, validate, retry, auto_reject, await_approval, apply, reject):
-        g.add_node(fn.__name__, _guarded(deps, fn))
-    g.add_node("perspective", perspective)      # 실패를 스스로 기록한다 (병렬이라 상태 전이는 종합 노드만)
+        g.add_node(fn.__name__, _timed(deps, fn.__name__, _guarded(deps, fn)))
+    g.add_node("perspective", _timed(deps, "perspective", perspective))   # 실패를 스스로 기록 (상태 전이는 종합 노드만)
     g.add_node("approval", approval)            # interrupt만 한다
     g.add_edge(START, "execute")
     g.add_conditional_edges("execute", route_analysis, ["analyze", "perspective", END])
@@ -363,6 +389,18 @@ def run_workflow(store: RunStore, registry: Registry, *, scenario_set: dict, cri
     analysis_mode="multi"면 perspectives(관점 정의)로 멀티에이전트 분석을 한다. 정의는 run.json에 복사된다.
     stop_before: 이 노드들 앞에서 멈춘다 (분석 방식 비교 평가처럼 일부 단계만 돌릴 때).
     """
+    run, start = prepare_run(store, registry, scenario_set=scenario_set, criteria=criteria, llm=llm,
+                             llm_config=llm_config, limits=limits, rehearsal=rehearsal, analysis_mode=analysis_mode,
+                             perspectives=perspectives, stop_before=stop_before)
+    start()
+    return store.load(run["run_id"])
+
+
+def prepare_run(store: RunStore, registry: Registry, *, scenario_set: dict, criteria: dict, llm, llm_config: dict,
+                limits: dict, rehearsal: bool, analysis_mode: str = "single",
+                perspectives: list[dict] | None = None, stop_before: list[str] | None = None):
+    """run.json을 만들고 (run, start)를 돌려준다. start()를 부르면 그래프가 돈다.
+    화면처럼 실행 ID를 먼저 알려 주고 그래프는 뒤에서 돌려야 할 때 쓴다."""
     if analysis_mode not in ("single", "multi"):
         raise ValueError(f"알 수 없는 분석 방식: {analysis_mode}")
     if analysis_mode == "multi" and not perspectives:
@@ -382,9 +420,12 @@ def run_workflow(store: RunStore, registry: Registry, *, scenario_set: dict, cri
                             "scenario_set": {"name": scenario_set["name"], "primary": run["scenario"]},
                             "analysis_mode": analysis_mode, "perspectives": {},
                             "retry_count": 0, "max_retries": int(limits.get("max_retries", 0)), "errors": []}
-    with compiled(deps) as graph:
-        graph.invoke(state, _config(run["run_id"]), interrupt_before=stop_before)
-    return store.load(run["run_id"])
+
+    def start() -> None:
+        with compiled(deps) as graph:
+            graph.invoke(state, _config(run["run_id"]), interrupt_before=stop_before)
+
+    return run, start
 
 
 def pending(store: RunStore, run_id: str) -> tuple[str, ...]:
@@ -424,7 +465,9 @@ def _decision_lock(store: RunStore, run_id: str):
     return file_lock(store.run_dir(run_id) / ".decision.lock", f"실행 {run_id}의 승인·반려")
 
 
-def approve(store: RunStore, run_id: str, proposal_id: str | None = None, note: str = "") -> dict:
+def approve(store: RunStore, run_id: str, proposal_id: str | None = None, note: str = "",
+            by: str | None = None) -> dict:
+    """by: 승인자 (화면에서 입력한 이름). 없으면 이 프로세스의 OS 사용자."""
     with _decision_lock(store, run_id):
         run = _awaiting(store, run_id)
         eligible = store.read(run_id, STAGE_FILES["4_validate"])["eligible"]
@@ -440,14 +483,14 @@ def approve(store: RunStore, run_id: str, proposal_id: str | None = None, note: 
             raise ValueError(f"실행 이후 챔피언이 v{run['registry']['champion_version']}에서 v{registry.champion()}로 "
                              "바뀌었으므로 승인할 수 없음. 다시 run 하라")
         # 반영 도중 중단된 실행은 다시 approve하면 apply 노드가 이어서 돌며, 이미 등록된 버전이면 다시 등록하지 않는다
-        return _resume(store, run_id, {"decision": "approved", "by": getpass.getuser(), "note": note,
+        return _resume(store, run_id, {"decision": "approved", "by": by or getpass.getuser(), "note": note,
                                        "proposal_id": proposal_id, "at": time.time()})
 
 
-def reject(store: RunStore, run_id: str, note: str = "") -> dict:
+def reject(store: RunStore, run_id: str, note: str = "", by: str | None = None) -> dict:
     with _decision_lock(store, run_id):
         run = _awaiting(store, run_id)
         if run.get("registry") and registry_of(run).find_by_run(run_id) is not None:
             raise ValueError(f"반영 도중 중단된 실행이므로 반려할 수 없음. approve {run_id}로 마무리하라")
-        return _resume(store, run_id, {"decision": "rejected", "by": getpass.getuser(), "note": note,
+        return _resume(store, run_id, {"decision": "rejected", "by": by or getpass.getuser(), "note": note,
                                        "at": time.time()})
