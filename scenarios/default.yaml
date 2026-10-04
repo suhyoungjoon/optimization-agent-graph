@@ -1,0 +1,11 @@
+# 기본 시나리오 세트. 학습용(train)은 분석·개선안 도출과 검증에, 검증용(validation)은 판정에만 쓴다.
+# 분석·제안 agent는 train의 첫 시나리오(primary)를 본다. 정답표(결함 정답)는 평가 코드만 본다.
+name: default
+train:
+  - {seed: 42, faults: [P1, P2, P3, P4]}
+  - {seed: 43, faults: [P1, P2, P3, P4]}
+  - {seed: 44, faults: [P1, P2, P3, P4]}
+validation:
+  - {seed: 101, faults: [P1, P2, P3, P4]}
+  - {seed: 102, faults: [P1, P2, P3, P4]}
+  - {seed: 103, faults: [P1, P2, P3, P4]}

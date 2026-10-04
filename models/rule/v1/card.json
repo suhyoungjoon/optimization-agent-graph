@@ -1,0 +1,11 @@
+{
+ "version": 1,
+ "model_version": "rule@v1",
+ "engine": "rule",
+ "parent": null,
+ "created_at": 1791092705.481232,
+ "source": {
+  "kind": "bootstrap",
+  "from": "engines/rule/params.yaml"
+ }
+}

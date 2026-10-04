@@ -1,6 +1,5 @@
 # 이 레포가 소유하는 규칙 엔진 params. 시작 버전은 코어 domains/dispatch/params.yaml
-# (optimization-agent-harness@1343534) 사본이며, 모델 레지스트리 v1(models/rule/v1)의 출처다.
-# M2부터 챔피언과 이후 버전은 models/rule/에 있다. 이 파일은 고치지 않는다.
+# (optimization-agent-harness@1343534) 사본이며, 이후 변경은 워크플로우 approve로만 반영한다.
 #
 # dispatch 규칙 파라미터 (초안).
 # 개선 루프(improvement)는 각 섹션의 bounds 안에서만 값을 바꿀 수 있다.

@@ -22,7 +22,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["workflow*", "engines*"]   # core·domains·api·scripts·configs는 코어 패키지 이름이라 쓰지 않는다
+include = ["workflow*", "engines*", "modelreg*"]   # core·domains·api·scripts·configs는 코어 패키지 이름이라 쓰지 않는다
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml"]
