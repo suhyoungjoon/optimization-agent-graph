@@ -8,6 +8,7 @@
     python -m workflow rollback [--engine rule] [--to N] --note "..."
     python -m workflow graph [--out workflow-graph.mmd]
     python -m workflow compare-analysis [--seed N] [--faults ...] [--rehearsal]
+    python -m workflow ui [--port 8100]        # 워크플로우 화면 (M3, 127.0.0.1 전용)
 
 경로 기본값은 이 레포 기준이다 (runs/, settings/, scenarios/, models/). 코어에는 경로를 항상 인자로 넘긴다.
 """
@@ -175,6 +176,9 @@ def main(argv: list[str] | None = None) -> int:
     p_rb.add_argument("--to", type=int, help="되돌릴 버전 번호 (생략하면 직전 챔피언)")
     p_rb.add_argument("--note", default="")
 
+    p_ui = sub.add_parser("ui", help="워크플로우 화면 (로컬 전용). 화면에서 시작하는 실행은 리허설만")
+    p_ui.add_argument("--port", type=int, default=8100)
+
     p_gr = sub.add_parser("graph", help="워크플로우 그래프를 Mermaid로 내보낸다")
     p_gr.add_argument("--out", type=Path, help="저장할 파일 (생략하면 화면에 출력)")
 
@@ -190,6 +194,16 @@ def main(argv: list[str] | None = None) -> int:
         registry = Registry(args.models_dir, getattr(args, "engine", None) or settings["engine"])
         if args.command in ("run", "compare-analysis"):
             perspectives = multi_analysis.load_perspectives(args.settings_dir / "analysis.yaml")
+        if args.command == "ui":
+            import uvicorn
+
+            from ui.server import create_app
+            app = create_app(runs_dir=args.runs_dir, models_dir=args.models_dir, settings=settings,
+                             settings_dir=args.settings_dir, scenarios_dir=args.scenarios_dir,
+                             rehearsal_llm_factory=lambda: _make_llm(args.settings_dir, args.runs_dir, True))
+            print(f"워크플로우 화면: http://127.0.0.1:{args.port}  (로컬 전용, 인증 없음)")
+            uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
+            return 0
         if args.command == "models":
             _print_models(registry)
             return 0
