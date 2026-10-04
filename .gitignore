@@ -1,0 +1,20 @@
+# secrets
+.env
+
+# run outputs (실행 결과·LLM 캐시)
+runs/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+build/
+dist/
+
+# os/editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,12 @@
+# 워크플로우 설정. 상한·기본값은 코드가 아니라 이 파일에서 읽는다.
+# M1 범위: 단계별 LLM 호출 상한, 기본 시나리오(단일 seed). 판정 기준·시나리오 세트·루프 반복은 M2.
+
+engine: rule
+
+scenario:                 # 1단계 실행에 쓰는 시나리오 (CLI --seed, --faults가 우선)
+  seed: 42
+  faults: [P1, P2, P3, P4]
+
+limits:
+  analyze_max_llm_calls: 30   # 2단계 분석 agent의 도구 루프 상한 (코어 analyze max_calls)
+  propose_max_llm_calls: 20   # 3단계 개선 agent의 도구 루프 상한 (코어 propose max_calls)

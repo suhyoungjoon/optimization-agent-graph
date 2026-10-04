@@ -1,0 +1,16 @@
+# LLM 설정 (코어 configs/llm.yaml 사본). 모델 교체는 이 파일만 바꾼다. 워크플로우가 load_config(이 경로)로 읽는다.
+model: claude-sonnet-5
+effort: medium                 # low | medium | high | xhigh | max
+max_tokens: 16000
+max_llm_calls_per_item: 12     # 한 항목에서 도구 호출 루프가 끝나지 않을 때 끊는 상한
+concurrency: 4                 # 동시에 실행할 run 수 (레벨·반복)
+cache: true                    # 입력 해시 캐시. 최종 측정 때는 끈다 (환경변수 LLM_CACHE=0이 우선)
+
+# 비용 계산용 단가 (USD / 100만 토큰, Anthropic 1st-party 기준, 2026-06 확인)
+pricing_per_mtok:
+  claude-sonnet-5: {input: 2.0, output: 10.0}
+  claude-opus-5: {input: 5.0, output: 25.0}
+  claude-opus-5-5: {input: 4.0, output: 20.0}
+  claude-haiku-4-5: {input: 1.0, output: 5.0}
+# 프롬프트 캐시 단가 배율 (입력 단가 대비): 쓰기 5분 TTL, 읽기
+cache_multipliers: {write: 1.25, read: 0.1}

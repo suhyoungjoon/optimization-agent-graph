@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "optimization-agent-graph"
+version = "0.1.0"
+description = "Workflow agent that improves optimization engines: run, analyze, propose, validate, apply"
+requires-python = ">=3.11"
+dependencies = [
+    # 코어는 커밋으로 고정한다 (코어 레포에 태그가 없음). 올릴 때는 docs/handoff.md도 같은 커밋으로 갱신
+    "optimization-agent-harness @ git+https://github.com/suhyoungjoon/optimization-agent-harness.git@1343534966ee7743b095a04e4fa00aad79576b42",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["workflow*", "engines*"]   # core·domains·api·scripts·configs는 코어 패키지 이름이라 쓰지 않는다
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
