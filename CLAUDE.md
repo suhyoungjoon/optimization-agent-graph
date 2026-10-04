@@ -50,7 +50,7 @@ runs/            실행 결과·DB·LLM 캐시 (git 제외)
 
 ## 기술 스택
 
-Python 3.11+, 코어 패키지(`optimization-agent-harness`), LangGraph(`langgraph`·`langgraph-checkpoint-sqlite`, 버전 고정, 오케스트레이션에만 사용), PyYAML, pytest. LLM은 코어의 `AnthropicClient`·`run_tool_loop`을 쓴다. UI는 M3에서 결정 (코어 레포의 React UI는 재사용하지 않음).
+Python 3.11+, 코어 패키지(`optimization-agent-harness`), LangGraph(`langgraph`·`langgraph-checkpoint-sqlite`, 버전 고정, 오케스트레이션에만 사용), PyYAML, pytest. LLM은 코어의 `AnthropicClient`·`run_tool_loop`을 쓴다. UI는 FastAPI + 빌드 없는 단일 페이지(바닐라 JS, 외부 CDN 없음). 코어 레포의 React UI는 재사용하지 않는다.
 
 ## 개발 규칙
 
@@ -74,10 +74,12 @@ python -m workflow models                                # 모델 버전·챔피
 python -m workflow rollback [--to N] --note "사유"        # 챔피언을 이전 버전으로 되돌림 (사람의 결정)
 python -m workflow graph [--out <파일>]                   # 워크플로우 그래프를 Mermaid로 내보냄
 python -m workflow compare-analysis --rehearsal          # 단일 대 멀티 분석 비교 (분석 단계까지만, runs/evals/)
+python -m workflow ui [--port 8100]                      # 워크플로우 화면 (M3, 127.0.0.1 전용)
 ```
 - 그래프(`workflow/graph.py`, LangGraph): 승인 대기는 interrupt, 체크포인트는 `runs/checkpoints.sqlite`(thread_id = run_id). `approve`·`reject`는 다른 프로세스에서 같은 실행을 재개한다. 단계 결과의 기준은 `runs/<run_id>/`의 JSON 파일이다.
 - M2 검증: 시나리오 세트는 `scenarios/<이름>.yaml`(기본 `default`: 학습 42·43·44, 검증 101·102·103). 1단계는 학습셋 전체, 분석·개선안 도출은 학습셋 첫 시나리오, 4단계는 학습셋+검증셋 전체로 비교한다. 판정 기준은 `settings/workflow.yaml`의 `criteria`(`workflow/judge.py`).
 - 챔피언은 모델 레지스트리(`models/<엔진>/v{n}/params.yaml` + `card.json`, `champion.json`)의 버전이다. 스냅샷은 바꾸지 않는다. `engines/rule/params.yaml`은 v1의 출처일 뿐이다. 테스트·리허설에서 커밋된 `models/`를 바꾸지 않으려면 `--models-dir`로 다른 디렉터리를 넘긴다.
+- M3 화면(`ui/`): FastAPI(`ui/server.py`) + 빌드 없는 단일 페이지(`ui/static/`). 기록을 읽기만 한다(컴파일된 그래프 구조, `get_state_history` 체크포인트, `runs/<run_id>/timings/` 노드 시간, 단계 파일, 레지스트리). 승인·반려는 `graph.approve/reject`(interrupt 재개)이고 승인자 이름을 입력받는다. 화면에서 시작하는 실행은 리허설만, 되돌리기는 CLI만. 인증이 없으므로 로컬에서만 띄운다.
 - X2: 결과분석 방식은 `analysis_mode`(기본 single) 또는 `--analysis`. 관점 agent 정의는 `settings/analysis.yaml`이며 실행마다 `run.json`에 복사된다. 리허설 비교 수치는 가짜 LLM 각본이므로 품질 근거로 쓰지 않는다.
 (명령이 바뀌면 이 섹션을 갱신한다.)
 
