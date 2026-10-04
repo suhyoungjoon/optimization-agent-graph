@@ -1,20 +1,20 @@
 """워크플로우 5단계. 각 함수는 코어 함수를 조합하고, 저장할 결과 dict를 돌려준다.
 
 엔진은 engines.Engine 계약으로만 다룬다 (pack_factory, load_params, spec_text, params_path).
+5단계(개선적용)는 모델 레지스트리(modelreg)에 새 버전을 등록하고 챔피언으로 지정한다 (workflow.graph의 apply 노드).
 """
 
-import hashlib
 import time
 from collections import Counter
 
-from core import (apply_params, check_params, finding_slices, params_errors, simulate_params,
-                  write_params)
+from core import apply_params, finding_slices, simulate_params
 from core import analyze as core_analyze
 from core import propose as core_propose
 
 from engines import Engine, model_version
 
-from .locks import file_lock
+from .judge import judge
+from .scenario_sets import SETS, primary
 
 TARGET_KIND = "params"   # 엔진이 개선할 수 있는 개선안 종류 (규칙 엔진: params만)
 
@@ -43,6 +43,33 @@ def execute(engine: Engine, params: dict, seed: int, faults: list[str]):
         "seconds": time.time() - started,
     }
     return instance, decisions, result
+
+
+def execute_set(engine: Engine, params: dict, scenario_set: dict):
+    """챔피언 모델을 학습용 세트 전체에 실행한다. 분석·개선안 도출은 첫 시나리오(primary)로 한다.
+
+    (primary instance, primary decisions, 결과). 결과의 최상위 항목은 primary 기준이고,
+    scenarios·mean_metrics에 학습용 세트 전체의 seed별·평균 지표가 있다.
+    """
+    started = time.time()
+    rows, first = [], None
+    for scenario in scenario_set["train"]:
+        instance, decisions, result = execute(engine, params, scenario["seed"], scenario["faults"])
+        if first is None:
+            first = (instance, decisions, result)
+        rows.append({**scenario, **{k: result[k] for k in ("items", "status_counts", "reason_counts", "metrics",
+                                                              "violations")}})
+    instance, decisions, result = first
+    names = sorted(rows[0]["metrics"])
+    return instance, decisions, {
+        **result,
+        "scenario_set": scenario_set["name"],
+        "primary": primary(scenario_set),
+        "scenarios": rows,
+        "mean_metrics": {m: sum(r["metrics"][m] for r in rows) / len(rows) for m in names},
+        "violations_total": sum(r["violations"] for r in rows),
+        "seconds": time.time() - started,
+    }
 
 
 # --- 2. 결과분석 (AI + 코드) --------------------------------------------------------
@@ -82,64 +109,50 @@ def propose(engine: Engine, params: dict, instance, report: dict, llm, llm_confi
 
 
 # --- 4. 검증 (코드) ---------------------------------------------------------------
-# M1: 같은 시나리오에서 simulate_params 1회 비교. 여러 seed·검증용 세트·판정 기준은 M2.
+# M2: 개선안마다 학습용·검증용 세트의 모든 시나리오에서 챔피언(전) 대 도전자(후)를 비교하고 판정 기준을 적용한다.
 
-def validate(engine: Engine, params: dict, instance, report: dict, proposed: dict) -> dict:
+def validate(engine: Engine, params: dict, report: dict, proposed: dict, scenario_set: dict, criteria: dict,
+             time_budget_s: float | None = None) -> dict:
+    started = time.time()
     slices = finding_slices(report)
+    pack = engine.pack_factory(params)
+    instances: dict[tuple, object] = {}
+
+    def instance_of(scenario: dict):
+        key = (scenario["seed"], tuple(scenario["faults"]))
+        if key not in instances:
+            instances[key] = pack.generate(scenario["seed"], scenario["faults"])[0]
+        return instances[key]
+
     candidates = []
     for item in proposed["proposals"]:
         if item["errors"]:
             continue
-        sim = simulate_params(engine.pack_factory, instance, params, apply_params(params, item["proposal"]), slices)
-        reasons = [] if sim["violations_after"] == 0 else [f"필수조건 위반 {sim['violations_after']}건"]
-        candidates.append({"id": item["id"], "title": item["proposal"].get("title", ""),
-                           "simulation": sim, "eligible": not reasons, "reasons": reasons})
+        candidate = apply_params(params, item["proposal"])
+        sets, exceeded = {}, False
+        for name in SETS:
+            rows = []
+            for scenario in scenario_set[name]:
+                if time_budget_s is not None and time.time() - started > time_budget_s:
+                    exceeded = True
+                    break
+                sim = simulate_params(engine.pack_factory, instance_of(scenario), params, candidate, slices)
+                rows.append({**scenario, "before": sim["before"], "after": sim["after"],
+                             "violations_after": sim["violations_after"], "slices": sim["slices"],
+                             "seconds": sim["seconds"]})
+            sets[name] = {"scenarios": rows}
+        verdict = judge({**sets, "budget_exceeded": exceeded}, criteria)
+        for name in SETS:
+            sets[name]["summary"] = verdict["summary"].get(name)
+        candidates.append({"id": item["id"], "title": item["proposal"].get("title", ""), "sets": sets,
+                           "judgement": {k: verdict[k] for k in ("passed", "checks", "reasons")},
+                           "eligible": verdict["passed"], "reasons": verdict["reasons"]})
     return {
-        "method": "simulate_params x1 (same scenario)",
-        "criteria": ["violations_after == 0"],
+        "method": "simulate_params per scenario (train + validation)",
+        "scenario_set": scenario_set["name"],
+        "criteria": criteria,
         "skipped": [{"id": p["id"], "errors": p["errors"]} for p in proposed["proposals"] if p["errors"]],
         "candidates": candidates,
         "eligible": [c["id"] for c in candidates if c["eligible"]],
+        "seconds": time.time() - started,
     }
-
-
-# --- 5. 개선적용 (사람 + 코드) ------------------------------------------------------
-
-def params_digest(engine: Engine) -> str:
-    return hashlib.sha256(engine.params_path.read_bytes()).hexdigest()
-
-
-def expected_after(champion: dict, proposal: dict) -> dict:
-    """champion에 proposal을 반영한 뒤의 params (version +1). 반영이 이미 끝났는지 확인할 때 쓴다."""
-    after = apply_params(champion, proposal)
-    after["version"] = int(champion["version"]) + 1
-    return after
-
-
-def apply(engine: Engine, proposal: dict, expected_sha256: str | None = None) -> dict:
-    """승인된 params 개선안을 엔진의 params 파일에 쓰고 version을 올린다.
-
-    expected_sha256: 실행 시점 params 파일의 해시. 잠금 안에서 다시 확인해, 검사 이후 파일이 바뀌었으면 쓰지 않는다.
-    """
-    with file_lock(engine.params_path.with_name(engine.params_path.name + ".lock"), "params 반영"):
-        if expected_sha256 is not None and params_digest(engine) != expected_sha256:
-            raise StageError(f"실행 이후 챔피언 params 파일이 바뀌었음: {engine.params_path}")
-        current = engine.load_params()
-        dims = engine.pack_factory(current).dimensions()
-        errors = params_errors(current, proposal, dims)
-        if errors:
-            raise StageError("현재 params에 적용할 수 없음: " + "; ".join(errors))
-        original = engine.params_path.read_text(encoding="utf-8")
-        before_version, after_version = write_params(engine.params_path, proposal)
-        written = engine.load_params()
-        problems = check_params(written, dims)
-        if problems:
-            engine.params_path.write_text(original, encoding="utf-8")   # 되돌리고 실패로 남긴다
-            raise StageError("반영 후 params 검사 실패: " + "; ".join(problems))
-    return applied_record(engine, before_version, written)
-
-
-def applied_record(engine: Engine, before_version: int, written: dict) -> dict:
-    return {"params_path": str(engine.params_path),
-            "version_before": before_version, "version_after": int(written["version"]),
-            "model_before": f"{engine.name}@v{before_version}", "model_after": model_version(engine, written)}

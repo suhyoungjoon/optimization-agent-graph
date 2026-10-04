@@ -1,159 +1,235 @@
-"""X1 LangGraph 오케스트레이션: M1과의 동등성, 프로세스를 넘는 재개, 재시도·소진, 실패, Mermaid."""
+"""LangGraph 워크플로우 (X1 + M2): 승인 대기·재개, 재시도, 판정, 레지스트리 반영, 잠금, 실패, Mermaid."""
 
-import itertools
 import os
-import shutil
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 import yaml
-from core import load_config
 
-import tests.fake_llm as fake_llm
-from engines import get_engine
+from modelreg import Registry
+from tests.conftest import CRITERIA, FADING, LIMITS, REPO, SMALL, champion_params
 from tests.fake_llm import FakeLLM, tool_use
-from tests.rehearsal import GOOD, OUT_OF_BOUNDS, SPEC, rehearsal_llm
-from workflow import graph, runner
-from workflow.cli import DEFAULT_SETTINGS
+from tests.rehearsal import BOUNDARY_RULE, GOOD, OUT_OF_BOUNDS, SPEC, rehearsal_llm
+from workflow import graph
 from workflow.machine import STAGE_FILES
 from workflow.store import RunStore
 
-REPO = Path(__file__).resolve().parent.parent
-LIMITS = {"analyze_max_llm_calls": 30, "propose_max_llm_calls": 20, "max_retries": 1}
-SEED, FAULTS = 42, ["P1", "P2", "P3", "P4"]
-VOLATILE = {"seconds", "at"}       # 실행마다 달라지는 시각·소요 시간
+def _run(store, registry, llm, llm_config, scenario_set=SMALL, limits=LIMITS, criteria=CRITERIA, **kw):
+    return graph.run_workflow(store, registry, scenario_set=scenario_set, criteria=criteria, llm=llm,
+                              llm_config=llm_config, limits=limits, rehearsal=True, **kw)
 
 
 @pytest.fixture
-def llm_config():
-    return {**load_config(DEFAULT_SETTINGS / "llm.yaml"), "cache": False}
+def store(tmp_path):
+    return RunStore(tmp_path / "runs")
 
 
-def _params(tmp_path, name):
-    path = tmp_path / name
-    shutil.copy(get_engine("rule").params_path, path)
-    return path
+# --- 실행·검증·승인 대기 ------------------------------------------------------------
+
+def test_run_stops_at_approval_with_judged_candidate(store, registry, llm_config):
+    run = _run(store, registry, rehearsal_llm(), llm_config)
+    run_id = run["run_id"]
+    assert run["status"] == "awaiting_approval"
+    assert [h["status"] for h in run["history"]] == ["running", "analyzed", "proposed", "validated",
+                                                      "awaiting_approval"]
+    # 재현 정보 (원칙 5)
+    assert run["model_version"] == "rule@v1" and run["registry"]["champion_version"] == 1
+    assert run["scenario_set"] == SMALL and run["scenario"] == SMALL["train"][0] and run["criteria"] == CRITERIA
+    assert run["llm"]["model"] == "fake-model" and run["core"]["version"]
+    assert registry.versions() == [1] and registry.champion() == 1       # 승인 전에는 레지스트리를 안 바꾼다
+
+    executed = store.read(run_id, STAGE_FILES["1_execute"])
+    assert [s["seed"] for s in executed["scenarios"]] == [42] and executed["violations_total"] == 0
+    validated = store.read(run_id, STAGE_FILES["4_validate"])
+    c1 = validated["candidates"][0]
+    assert validated["eligible"] == ["C1"] and [s["id"] for s in validated["skipped"]] == ["C2", "C3"]
+    assert [s["seed"] for s in c1["sets"]["train"]["scenarios"]] == [42]
+    assert [s["seed"] for s in c1["sets"]["validation"]["scenarios"]] == [101]
+    assert c1["judgement"]["passed"] and c1["sets"]["validation"]["summary"]["mean_gain"]["assignment_rate"] > 0.01
 
 
-def _strip(value):
-    if isinstance(value, dict):
-        return {k: _strip(v) for k, v in value.items() if k not in VOLATILE}
-    if isinstance(value, list):
-        return [_strip(v) for v in value]
-    return value
+def test_default_scenario_set_executes_all_train_seeds(store, registry, llm_config):
+    from workflow.scenario_sets import load_scenario_set
+    default = load_scenario_set("default", REPO / "scenarios")
+    run = _run(store, registry, rehearsal_llm(), llm_config, scenario_set=default)
+    executed = store.read(run["run_id"], STAGE_FILES["1_execute"])
+    assert [s["seed"] for s in executed["scenarios"]] == [42, 43, 44]
+    c1 = store.read(run["run_id"], STAGE_FILES["4_validate"])["candidates"][0]
+    assert [s["seed"] for s in c1["sets"]["validation"]["scenarios"]] == [101, 102, 103]
+    assert c1["sets"]["validation"]["summary"]["improved"] == 3 and run["status"] == "awaiting_approval"
 
 
-def _run(module, store, params_path, llm, llm_config, limits=LIMITS):
-    fake_llm._ids = itertools.count()       # 가짜 tool_use id를 실행마다 같게
-    return module.run_workflow(store, get_engine("rule", params_path), seed=SEED, faults=FAULTS, llm=llm,
-                               llm_config=llm_config, limits=limits, rehearsal=True)
-
-
-def test_same_stage_results_as_m1_state_machine(tmp_path, llm_config):
-    m1_store, x1_store = RunStore(tmp_path / "m1"), RunStore(tmp_path / "x1")
-    m1_params, x1_params = _params(tmp_path, "m1.yaml"), _params(tmp_path, "x1.yaml")
-    m1 = _run(runner, m1_store, m1_params, rehearsal_llm(), llm_config)
-    x1 = _run(graph, x1_store, x1_params, rehearsal_llm(), llm_config)
-
-    assert [h["status"] for h in m1["history"]] == [h["status"] for h in x1["history"]]
-    assert x1["status"] == "awaiting_approval" and x1["orchestrator"] == "langgraph"
-    for name in ("decisions.json", *(STAGE_FILES[s] for s in ("1_execute", "2_analyze", "3_propose", "4_validate"))):
-        assert _strip(m1_store.read(m1["run_id"], name)) == _strip(x1_store.read(x1["run_id"], name)), name
-
-    runner.approve(m1_store, m1["run_id"], note="same")
-    graph.approve(x1_store, x1["run_id"], note="same")
-    m1_apply = _strip(m1_store.read(m1["run_id"], STAGE_FILES["5_apply"]))
-    x1_apply = _strip(x1_store.read(x1["run_id"], STAGE_FILES["5_apply"]))
-    assert {k: v for k, v in m1_apply.items() if k != "params_path"} == \
-           {k: v for k, v in x1_apply.items() if k != "params_path"}
-    assert m1_params.read_text(encoding="utf-8") == x1_params.read_text(encoding="utf-8")
-    assert m1_store.load(m1["run_id"])["status"] == x1_store.load(x1["run_id"])["status"] == "applied"
-
-
-def _cli(*args, cwd=REPO):
-    env = {**os.environ, "PYTHONPATH": str(REPO)}
-    return subprocess.run([sys.executable, "-m", "workflow", *args], cwd=cwd, env=env,
-                          capture_output=True, text=True, timeout=300)
-
-
-def test_resume_from_checkpoint_in_new_process(tmp_path):
-    runs, params = tmp_path / "runs", _params(tmp_path, "params.yaml")
-    started = _cli("--runs-dir", str(runs), "run", "--rehearsal", "--params", str(params))
-    assert started.returncode == 0, started.stderr
-    run_id = RunStore(runs).list_runs()[0]["run_id"]
-    assert graph.pending(RunStore(runs), run_id) == ("approval",)      # 프로세스가 끝나도 승인 대기 지점이 남는다
-
-    approved = _cli("--runs-dir", str(runs), "approve", run_id, "--note", "다른 프로세스")
-    assert approved.returncode == 0, approved.stderr
-    assert "rule@v1 → rule@v2" in approved.stdout
-    assert yaml.safe_load(params.read_text(encoding="utf-8"))["version"] == 2
-    assert graph.pending(RunStore(runs), run_id) == ()                 # 그래프가 끝까지 갔다
-
-
-def test_retry_then_exhausted_ends_rejected(tmp_path, llm_config):
-    store, params = RunStore(tmp_path / "runs"), _params(tmp_path, "params.yaml")
-    llm = rehearsal_llm([OUT_OF_BOUNDS, SPEC])                          # 모든 시도가 탈락
-    salts = []
-    create = llm.create
-    llm.create = lambda **kw: (salts.append((kw["tools"][-1]["name"], kw.get("salt", ""))), create(**kw))[1]
-    run = _run(graph, store, params, llm, llm_config)
-
+def test_effect_disappearing_on_validation_is_filtered_then_rejected(store, registry, llm_config):
+    """M2 완료 기준: 검증용 세트에서 효과가 사라지는 개선안을 판정이 걸러낸다."""
+    run = _run(store, registry, rehearsal_llm(), llm_config, scenario_set=FADING)
     assert run["status"] == "rejected"
     assert [h["status"] for h in run["history"]] == ["running", "analyzed", "proposed", "validated",
                                                       "proposed", "validated", "rejected"]
-    assert store.has(run["run_id"], "3_propose.attempt0.json") and store.has(run["run_id"], "4_validate.attempt0.json")
-    decision = store.read(run["run_id"], STAGE_FILES["5_apply"])
-    assert decision["by"] == "workflow" and "재시도 1회 소진" in decision["note"]
-    # 재시도는 salt를 바꿔 LLM 캐시에서 같은 답이 돌아오지 않게 한다
-    assert {s for name, s in salts if name == "submit_proposals"} == {"", "retry-1"}
+    c1 = store.read(run["run_id"], STAGE_FILES["4_validate"])["candidates"][0]
+    assert c1["sets"]["train"]["summary"]["mean_gain"]["assignment_rate"] > 0.05   # 학습셋에선 효과가 크다
+    assert c1["sets"]["validation"]["summary"]["mean_gain"]["assignment_rate"] == pytest.approx(0.0)
+    assert not c1["eligible"] and any("validation 평균" in r for r in c1["reasons"])
+    assert "판정을 통과한 후보가 없음" in store.read(run["run_id"], STAGE_FILES["5_apply"])["note"]
+    assert registry.versions() == [1]
 
 
-def test_retry_recovers_when_second_attempt_passes(tmp_path, llm_config):
-    store, params = RunStore(tmp_path / "runs"), _params(tmp_path, "params.yaml")
-    run = _run(graph, store, params, rehearsal_llm([OUT_OF_BOUNDS], [GOOD]), llm_config)
-    assert run["status"] == "awaiting_approval"
-    assert store.read(run["run_id"], STAGE_FILES["4_validate"])["eligible"] == ["C1"]
-    assert "재시도 1회차" in run["history"][4]["note"]
-    graph.approve(store, run["run_id"])
-    assert yaml.safe_load(params.read_text(encoding="utf-8"))["version"] == 2
+def test_validation_time_budget(store, registry, llm_config):
+    run = _run(store, registry, rehearsal_llm(), llm_config, limits={**LIMITS, "validation_time_budget_s": 0,
+                                                                     "max_retries": 0})
+    c1 = store.read(run["run_id"], STAGE_FILES["4_validate"])["candidates"][0]
+    assert run["status"] == "rejected" and any("시간 예산" in r for r in c1["reasons"])
 
 
-def test_no_retry_when_limit_is_zero(tmp_path, llm_config):
-    store, params = RunStore(tmp_path / "runs"), _params(tmp_path, "params.yaml")
-    run = _run(graph, store, params, rehearsal_llm([OUT_OF_BOUNDS]), llm_config, {**LIMITS, "max_retries": 0})
-    assert run["status"] == "rejected" and not store.has(run["run_id"], "3_propose.attempt0.json")
+# --- 승인 → 레지스트리 --------------------------------------------------------------
 
+def test_approve_registers_new_champion_with_model_card(store, registry, llm_config):
+    run_id = _run(store, registry, rehearsal_llm(), llm_config)["run_id"]
+    run = graph.approve(store, run_id, note="ok")
 
-def test_reject_resumes_and_records(tmp_path, llm_config):
-    store, params = RunStore(tmp_path / "runs"), _params(tmp_path, "params.yaml")
-    before = params.read_text(encoding="utf-8")
-    run_id = _run(graph, store, params, rehearsal_llm(), llm_config)["run_id"]
-    run = graph.reject(store, run_id, note="부작용 확인 필요")
-    assert run["status"] == "rejected" and params.read_text(encoding="utf-8") == before
-    assert store.read(run_id, STAGE_FILES["5_apply"])["note"] == "부작용 확인 필요"
+    assert run["status"] == "applied" and registry.versions() == [1, 2] and registry.champion() == 2
+    applied = store.read(run_id, STAGE_FILES["5_apply"])
+    assert (applied["model_before"], applied["model_after"]) == ("rule@v1", "rule@v2") and not applied["recovered"]
+    card = registry.card(2)
+    assert card["parent"] == 1 and card["source"]["run_id"] == run_id and card["source"]["proposal_id"] == "C1"
+    assert card["validation"]["judgement"]["passed"] and card["approval"]["note"] == "ok"
+    assert card["validation"]["criteria"] == CRITERIA
+    assert champion_params(registry)["overrides"]["rules"] == [BOUNDARY_RULE]
+    assert registry.load_params(1)["overrides"]["rules"] == []              # 이전 스냅샷은 그대로
+
+    nxt = _run(store, registry, rehearsal_llm(), llm_config)                # 다음 실행은 새 챔피언으로
+    assert nxt["model_version"] == "rule@v2"
     with pytest.raises(ValueError, match="승인 대기 상태가 아님"):
         graph.approve(store, run_id)
 
 
-def test_approve_guards(tmp_path, llm_config):
-    store, params = RunStore(tmp_path / "runs"), _params(tmp_path, "params.yaml")
-    run_id = _run(graph, store, params, rehearsal_llm(), llm_config)["run_id"]
-    with pytest.raises(ValueError, match="후보가 아님"):
-        graph.approve(store, run_id, "C2")
-    params.write_text(params.read_text(encoding="utf-8") + "\n# 사람이 직접 고침\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="params 파일이 바뀌었"):
+def test_approve_refused_when_champion_changed_after_run(store, registry, llm_config):
+    first = _run(store, registry, rehearsal_llm(), llm_config)["run_id"]
+    second = _run(store, registry, rehearsal_llm(), llm_config)["run_id"]
+    graph.approve(store, first)
+    with pytest.raises(ValueError, match="챔피언이 v1에서 v2로"):
+        graph.approve(store, second)
+    assert store.load(second)["status"] == "awaiting_approval"
+
+
+def test_rollback_then_new_approval(store, registry, llm_config):
+    graph.approve(store, _run(store, registry, rehearsal_llm(), llm_config)["run_id"])
+    assert registry.rollback(by="test", note="부작용") == (2, 1)
+    run_id = _run(store, registry, rehearsal_llm(), llm_config)["run_id"]
+    assert store.load(run_id)["model_version"] == "rule@v1"                 # 되돌린 챔피언으로 실행
+    graph.approve(store, run_id)
+    assert registry.champion() == 3 and registry.card(3)["parent"] == 1     # 번호는 최대+1, 부모는 v1
+
+
+def test_multiple_candidates_need_explicit_choice(store, registry, llm_config):
+    run_id = _run(store, registry, rehearsal_llm([GOOD, {**GOOD, "title": "같은 안 다시"}]), llm_config)["run_id"]
+    with pytest.raises(ValueError, match="--proposal"):
         graph.approve(store, run_id)
-    assert store.load(run_id)["status"] == "awaiting_approval" and graph.pending(store, run_id) == ("approval",)
+    with pytest.raises(ValueError, match="후보가 아님"):
+        graph.approve(store, run_id, "C9")
+    graph.approve(store, run_id, "C2")
+    assert registry.card(2)["source"]["proposal_id"] == "C2"
 
 
-def test_node_failure_ends_failed(tmp_path, llm_config):
-    store, params = RunStore(tmp_path / "runs"), _params(tmp_path, "params.yaml")
+def test_reject_records_only(store, registry, llm_config):
+    run_id = _run(store, registry, rehearsal_llm(), llm_config)["run_id"]
+    run = graph.reject(store, run_id, note="부작용 확인 필요")
+    assert run["status"] == "rejected" and registry.versions() == [1]
+    assert store.read(run_id, STAGE_FILES["5_apply"])["note"] == "부작용 확인 필요"
+
+
+# --- 재개·재시도·실패 ----------------------------------------------------------------
+
+def _cli(*args):
+    env = {**os.environ, "PYTHONPATH": str(REPO)}
+    return subprocess.run([sys.executable, "-m", "workflow", *args], cwd=REPO, env=env, capture_output=True,
+                          text=True, timeout=300)
+
+
+def test_resume_from_checkpoint_in_new_process(tmp_path, registry):
+    runs, scen = tmp_path / "runs", tmp_path / "small.yaml"
+    scen.write_text(yaml.safe_dump(SMALL), encoding="utf-8")
+    common = ["--runs-dir", str(runs), "--models-dir", str(registry.root)]
+    started = _cli(*common, "run", "--rehearsal", "--scenario", str(scen))
+    assert started.returncode == 0, started.stderr
+    run_id = RunStore(runs).list_runs()[0]["run_id"]
+    assert graph.pending(RunStore(runs), run_id) == ("approval",)
+
+    approved = _cli(*common, "approve", run_id, "--note", "다른 프로세스")
+    assert approved.returncode == 0, approved.stderr
+    assert "rule@v1 → rule@v2" in approved.stdout and Registry(registry.root, "rule").champion() == 2
+    assert graph.pending(RunStore(runs), run_id) == ()
+
+    models = _cli(*common, "models")
+    assert "* v2" in models.stdout and "v1(bootstrap) → v2(promote)" in models.stdout
+    rolled = _cli(*common, "rollback", "--note", "확인")
+    assert rolled.returncode == 0 and "v2에서 v1로" in rolled.stdout
+
+
+def test_retry_recovers_when_second_attempt_passes(store, registry, llm_config):
+    run = _run(store, registry, rehearsal_llm([OUT_OF_BOUNDS], [GOOD]), llm_config)
+    assert run["status"] == "awaiting_approval" and "재시도 1회차" in run["history"][4]["note"]
+    assert store.has(run["run_id"], "3_propose.attempt0.json")
+
+
+def test_retry_exhausted_with_salt_change(store, registry, llm_config):
+    llm = rehearsal_llm([OUT_OF_BOUNDS, SPEC])
+    salts = []
+    create = llm.create
+    llm.create = lambda **kw: (salts.append((kw["tools"][-1]["name"], kw.get("salt", ""))), create(**kw))[1]
+    run = _run(store, registry, llm, llm_config)
+    assert run["status"] == "rejected" and "재시도 1회 소진" in store.read(run["run_id"], STAGE_FILES["5_apply"])["note"]
+    assert {s for name, s in salts if name == "submit_proposals"} == {"", "retry-1"}
+
+
+def test_node_failure_ends_failed(store, registry, llm_config):
     silent = FakeLLM(lambda item, n, messages, tools: tool_use("overview", {}))
-    run = _run(graph, store, params, silent, llm_config, {**LIMITS, "analyze_max_llm_calls": 3})
+    run = _run(store, registry, silent, llm_config, limits={**LIMITS, "analyze_max_llm_calls": 3})
     assert run["status"] == "failed" and "max_calls" in run["error"]["message"]
     assert graph.pending(store, run["run_id"]) == ()
+
+
+# --- 반영 안전성 ---------------------------------------------------------------------
+
+class _Crash(BaseException):
+    """프로세스가 죽은 것처럼 그래프 밖으로 빠져나간다 (노드의 Exception 처리에 잡히지 않음)."""
+
+
+def test_crash_after_register_recovers_without_double_registration(store, registry, llm_config, monkeypatch):
+    run_id = _run(store, registry, rehearsal_llm(), llm_config)["run_id"]
+    real = Registry._set_champion
+
+    def crash(self, *a, **kw):
+        raise _Crash()
+
+    monkeypatch.setattr(Registry, "_set_champion", crash)
+    with pytest.raises(_Crash):
+        graph.approve(store, run_id)
+    assert registry.versions() == [1, 2] and registry.champion() == 1       # 등록은 됐고 지정 전에 죽음
+    assert graph.pending(store, run_id) == ("apply",)
+    with pytest.raises(ValueError, match="반려할 수 없음"):
+        graph.reject(store, run_id)
+
+    monkeypatch.setattr(Registry, "_set_champion", real)
+    for leftover in registry.dir.glob(".lock"):
+        leftover.unlink()                                                   # 죽은 프로세스가 남긴 잠금
+    run = graph.approve(store, run_id)
+    assert run["status"] == "applied" and registry.versions() == [1, 2] and registry.champion() == 2
+    assert store.read(run_id, STAGE_FILES["5_apply"])["recovered"] is True
+
+
+def test_concurrent_decisions_are_locked(store, registry, llm_config):
+    from workflow.locks import LockBusy
+    run_id = _run(store, registry, rehearsal_llm(), llm_config)["run_id"]
+    lock = store.run_dir(run_id) / ".decision.lock"
+    lock.write_text("123")
+    with pytest.raises(LockBusy):
+        graph.approve(store, run_id)
+    lock.unlink()
+
+    (registry.dir / ".lock").write_text("123")                               # 다른 프로세스가 레지스트리를 바꾸는 중
+    run = graph.approve(store, run_id)
+    assert run["status"] == "failed" and "레지스트리" in run["error"]["message"] and registry.versions() == [1]
 
 
 def test_mermaid_export(tmp_path):
@@ -163,62 +239,3 @@ def test_mermaid_export(tmp_path):
         assert edge in text
     out = tmp_path / "graph.mmd"
     assert _cli("graph", "--out", str(out)).returncode == 0 and out.read_text(encoding="utf-8") == text
-
-
-class _Crash(BaseException):
-    """프로세스가 죽은 것처럼 그래프 밖으로 빠져나간다 (노드의 Exception 처리에 잡히지 않음)."""
-
-
-def test_crash_after_write_recovers_without_double_apply(tmp_path, llm_config, monkeypatch):
-    store, params = RunStore(tmp_path / "runs"), _params(tmp_path, "params.yaml")
-    run_id = _run(graph, store, params, rehearsal_llm(), llm_config)["run_id"]
-    real_apply = graph.stages.apply
-
-    def apply_then_crash(*args, **kwargs):
-        real_apply(*args, **kwargs)
-        raise _Crash()
-
-    monkeypatch.setattr(graph.stages, "apply", apply_then_crash)
-    with pytest.raises(_Crash):
-        graph.approve(store, run_id)
-    assert yaml.safe_load(params.read_text(encoding="utf-8"))["version"] == 2     # 파일은 이미 바뀜
-    assert store.load(run_id)["status"] == "awaiting_approval"                     # 체크포인트는 승인 대기
-    assert store.read(run_id, STAGE_FILES["5_apply"])["state"] == "applying"
-    with pytest.raises(ValueError, match="반려할 수 없음"):
-        graph.reject(store, run_id)
-
-    monkeypatch.setattr(graph.stages, "apply", real_apply)
-    run = graph.approve(store, run_id)                                             # 같은 결정으로 다시 재개
-    assert run["status"] == "applied"
-    assert yaml.safe_load(params.read_text(encoding="utf-8"))["version"] == 2     # 두 번 오르지 않는다
-    applied = store.read(run_id, STAGE_FILES["5_apply"])
-    assert applied["recovered"] is True and applied["model_after"] == "rule@v2"
-
-
-def test_concurrent_decisions_and_params_writes_are_locked(tmp_path, llm_config):
-    from workflow.locks import LockBusy
-    store, params = RunStore(tmp_path / "runs"), _params(tmp_path, "params.yaml")
-    run_id = _run(graph, store, params, rehearsal_llm(), llm_config)["run_id"]
-    lock = store.run_dir(run_id) / ".decision.lock"
-    lock.write_text("123")                                                         # 다른 approve가 진행 중
-    with pytest.raises(LockBusy):
-        graph.approve(store, run_id)
-    lock.unlink()
-
-    params_lock = params.with_name(params.name + ".lock")
-    params_lock.write_text("123")                                                  # 다른 실행이 같은 params에 반영 중
-    run = graph.approve(store, run_id)
-    assert run["status"] == "failed" and "params 반영" in run["error"]["message"]
-    assert yaml.safe_load(params.read_text(encoding="utf-8"))["version"] == 1
-    params_lock.unlink()
-
-
-def test_params_changed_between_check_and_write_is_refused(tmp_path, llm_config):
-    from workflow import stages
-    params = _params(tmp_path, "params.yaml")
-    engine = get_engine("rule", params)
-    digest = stages.params_digest(engine)
-    params.write_text(params.read_text(encoding="utf-8") + "\n# 바뀜\n", encoding="utf-8")
-    with pytest.raises(stages.StageError, match="바뀌었음"):
-        stages.apply(engine, GOOD, digest)
-    assert yaml.safe_load(params.read_text(encoding="utf-8"))["version"] == 1

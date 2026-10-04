@@ -66,19 +66,19 @@ Python 3.11+, 코어 패키지(`optimization-agent-harness`), LangGraph(`langgra
 pip install -e ".[dev]"      # 코어 포함 설치 (pyproject.toml에 코어를 커밋으로 고정)
 pytest
 python -m workflow run --rehearsal                       # 가짜 LLM으로 한 바퀴 (승인 대기에서 멈춤)
-python -m workflow run --seed 7 --faults P1,P4 --params <params 경로> --rehearsal
+python -m workflow run --scenario <세트 이름|yaml> --analysis multi --rehearsal
 python -m workflow status [<run_id>]                     # 실행 목록 / 단계별 결과
-python -m workflow approve <run_id> [--proposal C1]      # 사람 승인 → params version +1
+python -m workflow approve <run_id> [--proposal C1]      # 사람 승인 → 레지스트리에 새 버전 등록 + 챔피언 지정
 python -m workflow reject <run_id> --note "사유"          # 사람 반려 (기록만)
+python -m workflow models                                # 모델 버전·챔피언·이력
+python -m workflow rollback [--to N] --note "사유"        # 챔피언을 이전 버전으로 되돌림 (사람의 결정)
 python -m workflow graph [--out <파일>]                   # 워크플로우 그래프를 Mermaid로 내보냄
-python -m workflow run --analysis multi --rehearsal      # 멀티에이전트 분석 (관점 agent 4개 + 종합)
 python -m workflow compare-analysis --rehearsal          # 단일 대 멀티 분석 비교 (분석 단계까지만, runs/evals/)
 ```
-X2: 결과분석 방식은 `settings/workflow.yaml`의 `analysis_mode`(기본 single) 또는 `--analysis`로 고른다. 관점 agent 정의(관점·도구)는 `settings/analysis.yaml`이며 실행마다 `run.json`에 복사된다. 리허설 비교 수치는 가짜 LLM 각본이므로 품질 근거로 쓰지 않는다.
-X1부터 `run`은 LangGraph 그래프(`workflow/graph.py`)로 돈다. 승인 대기는 interrupt이고, 체크포인트는 `runs/checkpoints.sqlite`(thread_id = run_id)에 남는다. `approve`·`reject`는 다른 프로세스에서 같은 실행을 재개한다. 단계 결과의 기준은 여전히 `runs/<run_id>/`의 JSON 파일이다.
-`workflow/runner.py`(M1 상태 머신)는 동등성 테스트의 기준으로 남아 있다.
-M1에서는 시나리오를 `--seed`·`--faults`(기본값 `settings/workflow.yaml`)로 지정한다. `--scenario train`(시나리오 세트)은 M2.
-기본 params 파일은 `engines/rule/params.yaml`이다. 리허설에서 이 파일을 바꾸지 않으려면 복사본을 `--params`로 넘긴다.
+- 그래프(`workflow/graph.py`, LangGraph): 승인 대기는 interrupt, 체크포인트는 `runs/checkpoints.sqlite`(thread_id = run_id). `approve`·`reject`는 다른 프로세스에서 같은 실행을 재개한다. 단계 결과의 기준은 `runs/<run_id>/`의 JSON 파일이다.
+- M2 검증: 시나리오 세트는 `scenarios/<이름>.yaml`(기본 `default`: 학습 42·43·44, 검증 101·102·103). 1단계는 학습셋 전체, 분석·개선안 도출은 학습셋 첫 시나리오, 4단계는 학습셋+검증셋 전체로 비교한다. 판정 기준은 `settings/workflow.yaml`의 `criteria`(`workflow/judge.py`).
+- 챔피언은 모델 레지스트리(`models/<엔진>/v{n}/params.yaml` + `card.json`, `champion.json`)의 버전이다. 스냅샷은 바꾸지 않는다. `engines/rule/params.yaml`은 v1의 출처일 뿐이다. 테스트·리허설에서 커밋된 `models/`를 바꾸지 않으려면 `--models-dir`로 다른 디렉터리를 넘긴다.
+- X2: 결과분석 방식은 `analysis_mode`(기본 single) 또는 `--analysis`. 관점 agent 정의는 `settings/analysis.yaml`이며 실행마다 `run.json`에 복사된다. 리허설 비교 수치는 가짜 LLM 각본이므로 품질 근거로 쓰지 않는다.
 (명령이 바뀌면 이 섹션을 갱신한다.)
 
 ## 작업 방식

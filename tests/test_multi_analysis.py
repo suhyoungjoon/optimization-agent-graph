@@ -1,13 +1,13 @@
 """X2 멀티에이전트 분석: 관점 agent, 종합 agent의 근거 검사, 그래프 병렬 실행, 부분 실패, 단일 대 멀티 비교 평가."""
 
-import shutil
 import threading
 
 import pytest
 import yaml
-from core import Aggregator, load_config
+from core import Aggregator
 
 from engines import get_engine
+from tests.conftest import CRITERIA, LIMITS, SMALL
 from tests.fake_llm import FakeLLM, tool_use
 from tests.rehearsal import UNGROUNDED_TITLE, rehearsal_llm
 from workflow import evaluation, graph, multi_analysis, stages
@@ -15,15 +15,8 @@ from workflow.cli import DEFAULT_SETTINGS, main
 from workflow.machine import STAGE_FILES
 from workflow.store import RunStore
 
-LIMITS = {"analyze_max_llm_calls": 30, "propose_max_llm_calls": 20, "perspective_max_llm_calls": 15,
-          "synthesis_max_llm_calls": 3, "max_retries": 1}
 SEED, FAULTS = 42, ["P1", "P2", "P3", "P4"]
 PERSPECTIVES = multi_analysis.load_perspectives(DEFAULT_SETTINGS / "analysis.yaml")
-
-
-@pytest.fixture
-def llm_config():
-    return {**load_config(DEFAULT_SETTINGS / "llm.yaml"), "cache": False}
 
 
 @pytest.fixture(scope="module")
@@ -35,15 +28,8 @@ def scenario():
     return pack, instance, pack.solve(instance, params)
 
 
-@pytest.fixture
-def params_path(tmp_path):
-    path = tmp_path / "params.yaml"
-    shutil.copy(get_engine("rule").params_path, path)
-    return path
-
-
-def _multi(store, params_path, llm, llm_config, **kwargs):
-    return graph.run_workflow(store, get_engine("rule", params_path), seed=SEED, faults=FAULTS, llm=llm,
+def _multi(store, registry, llm, llm_config, **kwargs):
+    return graph.run_workflow(store, registry, scenario_set=SMALL, criteria=CRITERIA, llm=llm,
                               llm_config=llm_config, limits=LIMITS, rehearsal=True, analysis_mode="multi",
                               perspectives=PERSPECTIVES, **kwargs)
 
@@ -128,7 +114,7 @@ def test_synthesis_rejects_unknown_sources(scenario, llm_config):
 
 # --- 그래프 ---------------------------------------------------------------------------
 
-def test_multi_mode_graph_runs_perspectives_in_parallel(tmp_path, params_path, llm_config):
+def test_multi_mode_graph_runs_perspectives_in_parallel(tmp_path, registry, llm_config):
     store = RunStore(tmp_path / "runs")
     llm = rehearsal_llm()
     threads, barrier = set(), threading.Barrier(len(PERSPECTIVES), timeout=10)
@@ -142,7 +128,7 @@ def test_multi_mode_graph_runs_perspectives_in_parallel(tmp_path, params_path, l
         return create(**kw)
 
     llm.create = tracking_create
-    run = _multi(store, params_path, llm, llm_config)
+    run = _multi(store, registry, llm, llm_config)
     run_id = run["run_id"]
 
     assert run["status"] == "awaiting_approval" and len(threads) == len(PERSPECTIVES)
@@ -154,12 +140,12 @@ def test_multi_mode_graph_runs_perspectives_in_parallel(tmp_path, params_path, l
     assert report["mode"] == "multi" and len(report["findings"]) == 4
     assert store.read(run_id, STAGE_FILES["3_propose"])["proposals"]          # 3단계가 멀티 리포트로 동작
     graph.approve(store, run_id)
-    assert yaml.safe_load(params_path.read_text(encoding="utf-8"))["version"] == 2
+    assert registry.champion() == 2 and registry.card(2)["source"]["analysis_mode"] == "multi"
 
 
-def test_one_perspective_failure_is_recorded_and_others_continue(tmp_path, params_path, llm_config):
+def test_one_perspective_failure_is_recorded_and_others_continue(tmp_path, registry, llm_config):
     store = RunStore(tmp_path / "runs")
-    run = _multi(store, params_path, rehearsal_llm(failing_perspectives=("utilization",)), llm_config)
+    run = _multi(store, registry, rehearsal_llm(failing_perspectives=("utilization",)), llm_config)
     assert run["status"] == "awaiting_approval"
     assert "관점 3/4" in run["history"][1]["note"] and "utilization" in run["history"][1]["note"]
     report = store.read(run["run_id"], STAGE_FILES["2_analyze"])
@@ -167,16 +153,16 @@ def test_one_perspective_failure_is_recorded_and_others_continue(tmp_path, param
     assert len(report["findings"]) == 3
 
 
-def test_all_perspectives_failing_fails_run(tmp_path, params_path, llm_config):
+def test_all_perspectives_failing_fails_run(tmp_path, registry, llm_config):
     store = RunStore(tmp_path / "runs")
     llm = rehearsal_llm(failing_perspectives=tuple(p["id"] for p in PERSPECTIVES))
-    run = _multi(store, params_path, llm, llm_config)
+    run = _multi(store, registry, llm, llm_config)
     assert run["status"] == "failed" and "모든 관점 agent가 실패" in run["error"]["message"]
 
 
-def test_multi_mode_requires_perspectives(tmp_path, params_path, llm_config):
+def test_multi_mode_requires_perspectives(tmp_path, registry, llm_config):
     with pytest.raises(ValueError, match="관점 정의"):
-        graph.run_workflow(RunStore(tmp_path / "runs"), get_engine("rule", params_path), seed=SEED, faults=FAULTS,
+        graph.run_workflow(RunStore(tmp_path / "runs"), registry, scenario_set=SMALL, criteria=CRITERIA,
                            llm=rehearsal_llm(), llm_config=llm_config, limits=LIMITS, rehearsal=True,
                            analysis_mode="multi")
 
@@ -190,14 +176,14 @@ def test_mermaid_has_parallel_analysis_branch():
 
 # --- 비교 평가 ------------------------------------------------------------------------
 
-def test_compare_analysis_rehearsal(tmp_path, params_path, llm_config):
+def test_compare_analysis_rehearsal(tmp_path, registry, llm_config):
     llms = []
 
     def factory():
         llms.append(rehearsal_llm())
         return llms[-1]
 
-    out = evaluation.compare_analysis(tmp_path / "evals", get_engine("rule", params_path), seed=SEED, faults=FAULTS,
+    out = evaluation.compare_analysis(tmp_path / "evals", registry, seed=SEED, faults=FAULTS,
                                       llm_factory=factory, llm_config=llm_config, limits=LIMITS,
                                       perspectives=PERSPECTIVES, rehearsal=True)
     single, multi = out["results"]["single"], out["results"]["multi"]
@@ -216,12 +202,13 @@ def test_compare_analysis_rehearsal(tmp_path, params_path, llm_config):
     assert all(not store.has(r["run_id"], STAGE_FILES["3_propose"]) for r in out["results"].values())
 
 
-def test_cli_run_multi_and_compare(tmp_path, params_path, capsys):
-    runs = tmp_path / "runs"
-    assert main(["--runs-dir", str(runs), "run", "--rehearsal", "--analysis", "multi", "--params",
-                 str(params_path)]) == 0
+def test_cli_run_multi_and_compare(tmp_path, registry, capsys):
+    runs, scen = tmp_path / "runs", tmp_path / "small.yaml"
+    scen.write_text(yaml.safe_dump(SMALL), encoding="utf-8")
+    common = ["--runs-dir", str(runs), "--models-dir", str(registry.root)]
+    assert main([*common, "run", "--rehearsal", "--analysis", "multi", "--scenario", str(scen)]) == 0
     out = capsys.readouterr().out
     assert "[2 결과분석·멀티에이전트] 발견 4건" in out and "관점 작업자 활용률: U1" in out
-    assert main(["--runs-dir", str(runs), "compare-analysis", "--rehearsal", "--params", str(params_path)]) == 0
+    assert main([*common, "compare-analysis", "--rehearsal"]) == 0
     out = capsys.readouterr().out
     assert "리허설 예시" in out and "single   3/4" in out and "multi    4/4" in out

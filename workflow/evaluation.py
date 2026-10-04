@@ -10,10 +10,12 @@ import time
 
 from core import score
 
-from engines import Engine
+from engines import get_engine
+from modelreg import Registry
 
 from . import graph
 from .machine import STAGE_FILES
+from .scenario_sets import adhoc
 from .store import RunStore
 
 MODES = ("single", "multi")
@@ -26,12 +28,15 @@ def _tokens(usage: dict) -> dict:
     return {k: usage.get(k, 0) for k in keys}
 
 
-def compare_analysis(root, engine: Engine, *, seed: int, faults: list[str], llm_factory, llm_config: dict,
+def compare_analysis(root, registry: Registry, *, seed: int, faults: list[str], llm_factory, llm_config: dict,
                      limits: dict, perspectives: list[dict], rehearsal: bool) -> dict:
-    """llm_factory(): 방식마다 새 LLM 클라이언트. 결과는 root/<eval_id>/comparison.json에도 저장한다."""
+    """레지스트리의 챔피언으로 비교한다. llm_factory(): 방식마다 새 LLM 클라이언트.
+    결과는 root/<eval_id>/comparison.json에도 저장한다."""
     eval_root = RunStore(root)
     eval_id = eval_root.new_run_id()
     store = RunStore(eval_root.run_dir(eval_id))
+    champion = registry.bootstrap(get_engine(registry.engine).params_path, by="compare-analysis")
+    engine = get_engine(registry.engine, registry.params_path(champion))
     _, truth = engine.pack_factory(engine.load_params()).generate(seed, faults)
 
     results, model = {}, None
@@ -39,8 +44,8 @@ def compare_analysis(root, engine: Engine, *, seed: int, faults: list[str], llm_
         llm = llm_factory()
         model = llm.model
         started = time.time()
-        run = graph.run_workflow(store, engine, seed=seed, faults=faults, llm=llm, llm_config=llm_config,
-                                 limits=limits, rehearsal=rehearsal, analysis_mode=mode,
+        run = graph.run_workflow(store, registry, scenario_set=adhoc(seed, faults), criteria={}, llm=llm,
+                                 llm_config=llm_config, limits=limits, rehearsal=rehearsal, analysis_mode=mode,
                                  perspectives=perspectives if mode == "multi" else None, stop_before=["propose"])
         wall = time.time() - started
         if run["status"] != "analyzed":
@@ -69,7 +74,7 @@ def compare_analysis(root, engine: Engine, *, seed: int, faults: list[str], llm_
         }
 
     comparison = {"eval_id": eval_id, "label": REHEARSAL_LABEL if rehearsal else REAL_LABEL,
-                  "rehearsal": rehearsal, "engine": engine.name, "scenario": {"seed": seed, "faults": list(faults)},
+                  "rehearsal": rehearsal, "engine": engine.name, "model_version": f"{engine.name}@v{champion}", "scenario": {"seed": seed, "faults": list(faults)},
                   "llm_model": model, "results": results}
     eval_root.write(eval_id, "comparison.json", comparison)
     return comparison

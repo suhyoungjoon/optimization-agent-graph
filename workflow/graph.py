@@ -5,15 +5,17 @@
   인스턴스는 엔진·seed·결함으로 재생성하고, 결정 레코드는 decisions.json에서 읽는다.
 - 체크포인트는 runs/checkpoints.sqlite (thread_id = run_id). 승인 대기는 interrupt로 멈추고,
   approve/reject가 다른 프로세스에서 Command(resume=...)로 같은 실행을 재개한다.
+- M2: 챔피언은 모델 레지스트리(modelreg)의 버전이다. 1단계는 학습용 세트 전체, 4단계는 학습용·검증용 세트 전체에서
+  비교하고 판정 기준(settings/workflow.yaml criteria)을 적용한다. 승인하면 새 버전을 등록하고 챔피언으로 지정한다.
 """
 
 import getpass
 import sqlite3
 import time
 import traceback
+import threading
 from contextlib import contextmanager
 from pathlib import Path
-import threading
 from typing import Annotated, TypedDict
 
 from core import DecisionRecord
@@ -21,13 +23,13 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, Send, interrupt
 
-from engines import Engine
+from engines import Engine, get_engine
+from modelreg import Registry
 
 from . import multi_analysis, stages
-from .machine import STAGE_FILES, transition
 from .locks import file_lock
-from .runner import engine_of, new_run
-from .stages import params_digest
+from .machine import STAGE_FILES, transition
+from .records import engine_of, new_run
 from .store import RunStore
 
 CHECKPOINT_DB = "checkpoints.sqlite"
@@ -119,18 +121,19 @@ def _guarded(deps: Deps, fn):
 def build_graph(deps: Deps):
     store = deps.store
 
-    # --- 1~4단계: M1과 같은 stages 함수, 같은 파일 ---------------------------------
+    # --- 1~4단계 ------------------------------------------------------------------
 
     def execute(state: WorkflowState) -> dict:
+        """학습용 세트 전체 실행. 결정 레코드는 분석에 쓰는 첫 시나리오(primary)의 것만 저장한다."""
         run_id = state["run_id"]
         engine, params = deps.engine(run_id), deps.champion(run_id)
-        run = deps.run(run_id)
-        instance, decisions, executed = stages.execute(engine, params, run["scenario"]["seed"],
-                                                       run["scenario"]["faults"])
-        deps._cache[run_id] = (instance, None)
+        instance, decisions, executed = stages.execute_set(engine, params, deps.run(run_id)["scenario_set"])
+        with deps._lock:
+            deps._cache[run_id] = (instance, None)
         store.write(run_id, "decisions.json", decisions)
         store.write(run_id, STAGE_FILES["1_execute"], {**executed, "decisions_file": "decisions.json"})
-        return {"execution": {"metrics": executed["metrics"], "violations": executed["violations"],
+        return {"execution": {"metrics": executed["metrics"], "mean_metrics": executed["mean_metrics"],
+                              "violations": executed["violations_total"],
                               "decisions_file": "decisions.json", "file": STAGE_FILES["1_execute"]}}
 
     def analyze(state: WorkflowState) -> dict:
@@ -191,9 +194,11 @@ def build_graph(deps: Deps):
 
     def validate(state: WorkflowState) -> dict:
         run_id = state["run_id"]
-        validated = stages.validate(deps.engine(run_id), deps.champion(run_id), deps.instance(run_id),
+        run = deps.run(run_id)
+        validated = stages.validate(deps.engine(run_id), deps.champion(run_id),
                                     store.read(run_id, STAGE_FILES["2_analyze"]),
-                                    store.read(run_id, STAGE_FILES["3_propose"]))
+                                    store.read(run_id, STAGE_FILES["3_propose"]),
+                                    run["scenario_set"], run["criteria"], run["limits"].get("validation_time_budget_s"))
         store.write(run_id, STAGE_FILES["4_validate"], validated)
         status = deps.advance(run_id, "validated", f"승인 후보 {len(validated['eligible'])}건")
         return {"status": status, "validation": {"eligible": validated["eligible"], "file": STAGE_FILES["4_validate"]}}
@@ -211,7 +216,7 @@ def build_graph(deps: Deps):
     def auto_reject(state: WorkflowState) -> dict:
         run_id = state["run_id"]
         retries = state.get("retry_count", 0)
-        note = "검증을 통과한 후보가 없음" + (f" (재시도 {retries}회 소진)" if retries else "")
+        note = "판정을 통과한 후보가 없음" + (f" (재시도 {retries}회 소진)" if retries else "")
         decision = {"decision": "rejected", "by": "workflow", "note": note, "at": time.time()}
         store.write(run_id, STAGE_FILES["5_apply"], decision)
         return {"status": deps.advance(run_id, "rejected", note), "decision": decision}
@@ -228,27 +233,44 @@ def build_graph(deps: Deps):
     # --- 5단계 -----------------------------------------------------------------
 
     def apply(state: WorkflowState) -> dict:
-        """반영 전에 'applying' 표시를 남긴다. 반영 후 체크포인트 전에 프로세스가 죽어 이 노드가 다시 돌면,
-        파일이 이미 기대한 결과와 같은지 확인하고 다시 쓰지 않는다 (version이 두 번 오르지 않게)."""
+        """승인된 도전자를 레지스트리에 새 버전으로 등록하고 챔피언으로 지정한다 (레지스트리 잠금 안에서).
+
+        멱등: 반영 후 체크포인트 전에 프로세스가 죽어 이 노드가 다시 돌면, 이 실행이 등록한 버전을 찾아
+        다시 등록하지 않고 챔피언 지정만 마무리한다.
+        """
         run_id, decision = state["run_id"], state["decision"]
         if decision["proposal_id"] not in state["validation"]["eligible"]:
             raise stages.StageError(f"검증을 통과한 후보가 아님: {decision['proposal_id']}")
+        run = deps.run(run_id)
         proposal = next(p["proposal"] for p in store.read(run_id, STAGE_FILES["3_propose"])["proposals"]
                         if p["id"] == decision["proposal_id"])
-        engine, champion, run = deps.engine(run_id), deps.champion(run_id), deps.run(run_id)
-        marker = store.read(run_id, STAGE_FILES["5_apply"]) if store.has(run_id, STAGE_FILES["5_apply"]) else {}
-        if marker.get("state") == "applying" and engine.load_params() == stages.expected_after(champion, proposal):
-            applied = {**stages.applied_record(engine, int(champion["version"]), engine.load_params()),
-                       "recovered": True}
-        else:
-            store.write(run_id, STAGE_FILES["5_apply"], {**decision, "state": "applying"})
-            try:
-                applied = stages.apply(engine, proposal, run["params_sha256"])
-            except Exception as exc:
-                store.write(run_id, STAGE_FILES["5_apply"], {**decision, "state": "error", "error": str(exc)})
-                raise
+        candidate = next(c for c in store.read(run_id, STAGE_FILES["4_validate"])["candidates"]
+                         if c["id"] == decision["proposal_id"])
+        registry = registry_of(run)
+        with registry.lock():
+            version = registry.find_by_run(run_id)
+            recovered = version is not None
+            if not recovered:
+                if registry.champion() != run["registry"]["champion_version"]:
+                    raise stages.StageError(f"실행 이후 챔피언이 v{run['registry']['champion_version']}에서 "
+                                            f"v{registry.champion()}로 바뀌었음. 다시 run 하라")
+                version = registry._register(run["registry"]["champion_version"], proposal, {
+                    "source": {"kind": "workflow", "run_id": run_id, "proposal_id": decision["proposal_id"],
+                               "title": proposal.get("title"), "scenario_set": run["scenario_set"]["name"],
+                               "analysis_mode": (run.get("analysis") or {}).get("mode", "single")},
+                    "validation": {"judgement": candidate["judgement"],
+                                   "sets": {k: s["summary"] for k, s in candidate["sets"].items()},
+                                   "criteria": run["criteria"]},
+                    "approval": {k: decision.get(k) for k in ("by", "note", "at")}})
+            if registry.champion() != version:
+                registry._set_champion(version, by=decision["by"], note=f"run {run_id} 승인 ({decision['proposal_id']})",
+                                       action="promote")
+        before = run["model_version"]
+        after = registry.card(version)["model_version"]
+        applied = {"model_before": before, "model_after": after, "version": version,
+                   "params_path": str(registry.params_path(version)), "recovered": recovered}
         store.write(run_id, STAGE_FILES["5_apply"], {**decision, **applied, "state": "applied"})
-        return {"status": deps.advance(run_id, "applied", f"{applied['model_before']} → {applied['model_after']}")}
+        return {"status": deps.advance(run_id, "applied", f"{before} → {after}")}
 
     def reject(state: WorkflowState) -> dict:
         run_id, decision = state["run_id"], state["decision"]
@@ -321,12 +343,19 @@ def mermaid() -> str:
 
 # --- 공개 함수 (CLI) ------------------------------------------------------------------
 
-def run_workflow(store: RunStore, engine: Engine, *, seed: int, faults: list[str], llm, llm_config: dict,
+def registry_of(run: dict) -> Registry:
+    if not run.get("registry"):
+        raise ValueError(f"레지스트리 없이 만든 실행은 승인할 수 없음: {run['run_id']}")
+    return Registry(run["registry"]["root"], run["engine"])
+
+
+def run_workflow(store: RunStore, registry: Registry, *, scenario_set: dict, criteria: dict, llm, llm_config: dict,
                  limits: dict, rehearsal: bool, analysis_mode: str = "single",
                  perspectives: list[dict] | None = None, stop_before: list[str] | None = None) -> dict:
-    """1~4단계를 돌고 승인 대기(interrupt)에서 멈춘다. 승인 후보가 없으면 재시도 후 자동 반려(rejected),
-    노드 실패 시 failed로 끝난다. 최종 run(run.json)을 돌려준다.
+    """레지스트리의 챔피언으로 1~4단계를 돌고 승인 대기(interrupt)에서 멈춘다. 판정을 통과한 후보가 없으면
+    재시도 후 자동 반려(rejected), 노드 실패 시 failed로 끝난다. 최종 run(run.json)을 돌려준다.
 
+    레지스트리가 비어 있으면 엔진 기본 params를 첫 버전으로 등록한다.
     analysis_mode="multi"면 perspectives(관점 정의)로 멀티에이전트 분석을 한다. 정의는 run.json에 복사된다.
     stop_before: 이 노드들 앞에서 멈춘다 (분석 방식 비교 평가처럼 일부 단계만 돌릴 때).
     """
@@ -334,14 +363,19 @@ def run_workflow(store: RunStore, engine: Engine, *, seed: int, faults: list[str
         raise ValueError(f"알 수 없는 분석 방식: {analysis_mode}")
     if analysis_mode == "multi" and not perspectives:
         raise ValueError("멀티에이전트 분석에는 관점 정의가 필요하다")
-    run = new_run(store, engine, seed=seed, faults=faults, llm_model=llm.model, llm_config=llm_config,
-                  limits=limits, rehearsal=rehearsal, orchestrator="langgraph")
-    run["analysis"] = {"mode": analysis_mode, **({"perspectives": perspectives} if analysis_mode == "multi" else {})}
-    store.save(run)
+    champion = registry.bootstrap(get_engine(registry.engine).params_path, by=getpass.getuser())
+    engine = get_engine(registry.engine, registry.params_path(champion))
+    run = new_run(store, engine, scenario_set=scenario_set, llm_model=llm.model, llm_config=llm_config,
+                  limits=limits, rehearsal=rehearsal, extra={
+                      "registry": {"root": str(registry.root.resolve()), "champion_version": champion},
+                      "criteria": criteria,
+                      "analysis": {"mode": analysis_mode,
+                                   **({"perspectives": perspectives} if analysis_mode == "multi" else {})}})
     store.write(run["run_id"], CHAMPION_FILE, engine.load_params())
     deps = Deps(store, llm, llm_config)
     state: WorkflowState = {"run_id": run["run_id"], "status": "running", "engine": engine.name,
-                            "model_version": run["model_version"], "scenario_set": run["scenario"],
+                            "model_version": run["model_version"],
+                            "scenario_set": {"name": scenario_set["name"], "primary": run["scenario"]},
                             "analysis_mode": analysis_mode, "perspectives": {},
                             "retry_count": 0, "max_retries": int(limits.get("max_retries", 0)), "errors": []}
     with compiled(deps) as graph:
@@ -396,20 +430,20 @@ def approve(store: RunStore, run_id: str, proposal_id: str | None = None, note: 
             proposal_id = eligible[0]
         if proposal_id not in eligible:
             raise ValueError(f"검증을 통과한 후보가 아님: {proposal_id} (후보: {eligible})")
-        interrupted = (store.has(run_id, STAGE_FILES["5_apply"])
-                       and store.read(run_id, STAGE_FILES["5_apply"]).get("state") == "applying")
-        if not interrupted and params_digest(engine_of(run)) != run["params_sha256"]:
-            raise ValueError("실행 이후 챔피언 params 파일이 바뀌었으므로 승인할 수 없음. 다시 run 하라: "
-                             + run["params_path"])
-        # 반영 도중 중단된 실행은 다시 approve하면 apply 노드가 이어서 돌며, 이미 반영된 파일이면 다시 쓰지 않는다
+        registry = registry_of(run)
+        interrupted = registry.find_by_run(run_id) is not None
+        if not interrupted and registry.champion() != run["registry"]["champion_version"]:
+            raise ValueError(f"실행 이후 챔피언이 v{run['registry']['champion_version']}에서 v{registry.champion()}로 "
+                             "바뀌었으므로 승인할 수 없음. 다시 run 하라")
+        # 반영 도중 중단된 실행은 다시 approve하면 apply 노드가 이어서 돌며, 이미 등록된 버전이면 다시 등록하지 않는다
         return _resume(store, run_id, {"decision": "approved", "by": getpass.getuser(), "note": note,
                                        "proposal_id": proposal_id, "at": time.time()})
 
 
 def reject(store: RunStore, run_id: str, note: str = "") -> dict:
     with _decision_lock(store, run_id):
-        _awaiting(store, run_id)
-        if store.has(run_id, STAGE_FILES["5_apply"]) and store.read(run_id, STAGE_FILES["5_apply"]).get("state") == "applying":
+        run = _awaiting(store, run_id)
+        if run.get("registry") and registry_of(run).find_by_run(run_id) is not None:
             raise ValueError(f"반영 도중 중단된 실행이므로 반려할 수 없음. approve {run_id}로 마무리하라")
         return _resume(store, run_id, {"decision": "rejected", "by": getpass.getuser(), "note": note,
                                        "at": time.time()})
