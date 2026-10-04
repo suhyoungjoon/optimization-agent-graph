@@ -62,7 +62,8 @@ def test_default_scenario_set_executes_all_train_seeds(store, registry, llm_conf
 
 def test_effect_disappearing_on_validation_is_filtered_then_rejected(store, registry, llm_config):
     """M2 완료 기준: 검증용 세트에서 효과가 사라지는 개선안을 판정이 걸러낸다."""
-    run = _run(store, registry, rehearsal_llm(), llm_config, scenario_set=FADING)
+    llm = rehearsal_llm()
+    run = _run(store, registry, llm, llm_config, scenario_set=FADING)
     assert run["status"] == "rejected"
     assert [h["status"] for h in run["history"]] == ["running", "analyzed", "proposed", "validated",
                                                       "proposed", "validated", "rejected"]
@@ -72,6 +73,14 @@ def test_effect_disappearing_on_validation_is_filtered_then_rejected(store, regi
     assert not c1["eligible"] and any("validation 평균" in r for r in c1["reasons"])
     assert "판정을 통과한 후보가 없음" in store.read(run["run_id"], STAGE_FILES["5_apply"])["note"]
     assert registry.versions() == [1]
+    # 재시도한 개선 agent는 앞 시도의 탈락 이유를 입력으로 받는다 (코어 propose feedback)
+    starts = [c["messages"][0]["content"] for c in llm.calls
+              if len(c["messages"]) == 1 and any(t["name"] == "submit_proposals" for t in c["tools"])]
+    assert len(starts) == 2 and "이전 시도에서 탈락한 이유" not in starts[0]
+    retry_input = starts[1]
+    assert "이전 시도에서 탈락한 이유" in retry_input
+    assert "C1 경계 지역만 3단계 지역 범위 +1km: 판정 탈락 - validation 평균 assignment_rate 개선" in retry_input
+    assert "C2 전역 3단계 지역 범위 대폭 완화: 허용 범위·대상 검사 탈락" in retry_input
 
 
 def test_validation_time_budget(store, registry, llm_config):

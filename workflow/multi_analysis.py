@@ -11,11 +11,8 @@ import json
 from pathlib import Path
 
 import yaml
-from core import Aggregator, run_tool_loop, usage_dict
+from core import Aggregator, grounding_problems, report_submit_tool, run_tool_loop, usage_dict
 from core.analysis.agent import SYSTEM as ANALYST_SYSTEM
-# 코어 분석 agent의 제출 스키마·근거 검사. 공개 API가 아니어서 모듈 경로로 가져온다 (코어 고정 커밋 기준)
-from core.analysis.agent import _problems as grounding_problems
-from core.analysis.agent import _submit_tool as report_submit_tool
 
 SYNTH_SUBMIT = "submit_synthesis"
 SYNTH_MARK = "[종합]"

@@ -50,10 +50,8 @@ def _make_llm(settings_dir: Path, runs_dir: Path, rehearsal: bool):
             raise SystemExit(f"--rehearsal은 레포 루트에서 실행해야 한다 (tests/ import 실패: {exc})")
         return rehearsal_llm(), {**llm_config, "cache": False}
     from core import AnthropicClient, ResponseCache
-    from core.llm.client import load_dotenv
-    load_dotenv(REPO_ROOT / ".env")     # 코어 기본값은 site-packages의 .env라서 먼저 이 레포 .env를 읽는다
     cache = ResponseCache(runs_dir / "llm_cache.sqlite") if llm_config.get("cache") else None
-    return AnthropicClient(config=llm_config, cache=cache), llm_config
+    return AnthropicClient(config=llm_config, cache=cache, env_path=REPO_ROOT / ".env"), llm_config
 
 
 def _print_summary(info: dict) -> None:

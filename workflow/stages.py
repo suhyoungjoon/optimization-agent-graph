@@ -91,11 +91,12 @@ def check_report(report: dict) -> dict:
 # --- 3. 개선안 도출 (AI + 코드) -----------------------------------------------------
 
 def propose(engine: Engine, params: dict, instance, report: dict, llm, llm_config: dict, max_calls: int,
-            salt: str = "") -> dict:
-    """salt: 재시도 때 같은 요청이 LLM 캐시에서 같은 답으로 돌아오지 않게 시도마다 바꾼다."""
+            salt: str = "", feedback: list[str] | None = None) -> dict:
+    """salt: 재시도 때 같은 요청이 LLM 캐시에서 같은 답으로 돌아오지 않게 시도마다 바꾼다.
+    feedback: 앞 시도의 개선안이 탈락한 이유 (코어 propose가 입력 끝에 붙인다)."""
     pack = engine.pack_factory(params)
     out = core_propose(engine.pack_factory, instance, params, engine.spec_text(), pack.dimensions(), report,
-                       llm, llm_config, salt=salt, max_calls=max_calls)
+                       llm, llm_config, salt=salt, max_calls=max_calls, feedback=feedback)
     if out["stop"] != "submitted":
         raise StageError(f"개선 agent가 개선안을 제출하지 않음 (stop={out['stop']})")
     proposals = []
@@ -106,6 +107,16 @@ def propose(engine: Engine, params: dict, instance, report: dict, llm, llm_confi
                       f"대상은 {TARGET_KIND})"]
         proposals.append({"id": f"C{i}", "proposal": item["proposal"], "errors": errors})
     return {**out, "proposals": proposals}
+
+
+def rejection_feedback(proposed: dict, validated: dict) -> list[str]:
+    """탈락한 시도에서 개선안마다 왜 떨어졌는지 (다음 시도의 개선 agent에게 준다)."""
+    titles = {p["id"]: p["proposal"].get("title", "") for p in proposed["proposals"]}
+    lines = [f"{s['id']} {titles.get(s['id'], '')}: 허용 범위·대상 검사 탈락 - {'; '.join(s['errors'])}"
+             for s in validated["skipped"]]
+    lines += [f"{c['id']} {c['title']}: 판정 탈락 - {'; '.join(c['reasons'])}" for c in validated["candidates"]
+              if not c["eligible"]]
+    return lines
 
 
 # --- 4. 검증 (코드) ---------------------------------------------------------------

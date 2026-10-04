@@ -180,9 +180,13 @@ def build_graph(deps: Deps):
     def propose(state: WorkflowState) -> dict:
         run_id, attempt = state["run_id"], state.get("retry_count", 0)
         report = store.read(run_id, STAGE_FILES["2_analyze"])
+        feedback = []
+        for n in range(attempt):                 # 앞선 모든 시도의 탈락 이유
+            feedback += stages.rejection_feedback(store.read(run_id, f"3_propose.attempt{n}.json"),
+                                                  store.read(run_id, f"4_validate.attempt{n}.json"))
         proposed = stages.propose(deps.engine(run_id), deps.champion(run_id), deps.instance(run_id), report,
                                   deps.llm, deps.llm_config, deps.run(run_id)["limits"]["propose_max_llm_calls"],
-                                  salt=f"retry-{attempt}" if attempt else "")
+                                  salt=f"retry-{attempt}" if attempt else "", feedback=feedback or None)
         store.write(run_id, STAGE_FILES["3_propose"], proposed)
         valid = sum(1 for p in proposed["proposals"] if not p["errors"])
         note = f"개선안 {len(proposed['proposals'])}건, 허용 범위 통과 {valid}건" + (f" (재시도 {attempt}회차)"
