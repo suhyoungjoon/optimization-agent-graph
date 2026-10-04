@@ -1,17 +1,20 @@
 """워크플로우 5단계. 각 함수는 코어 함수를 조합하고, 저장할 결과 dict를 돌려준다.
 
 엔진은 engines.Engine 계약으로만 다룬다 (pack_factory, load_params, spec_text, params_path).
+5단계(개선적용)는 모델 레지스트리(modelreg)에 새 버전을 등록하고 챔피언으로 지정한다 (workflow.graph의 apply 노드).
 """
 
 import time
 from collections import Counter
 
-from core import (apply_params, check_params, finding_slices, params_errors, simulate_params,
-                  write_params)
+from core import apply_params, finding_slices, simulate_params
 from core import analyze as core_analyze
 from core import propose as core_propose
 
 from engines import Engine, model_version
+
+from .judge import judge
+from .scenario_sets import SETS, primary
 
 TARGET_KIND = "params"   # 엔진이 개선할 수 있는 개선안 종류 (규칙 엔진: params만)
 
@@ -42,10 +45,42 @@ def execute(engine: Engine, params: dict, seed: int, faults: list[str]):
     return instance, decisions, result
 
 
+def execute_set(engine: Engine, params: dict, scenario_set: dict):
+    """챔피언 모델을 학습용 세트 전체에 실행한다. 분석·개선안 도출은 첫 시나리오(primary)로 한다.
+
+    (primary instance, primary decisions, 결과). 결과의 최상위 항목은 primary 기준이고,
+    scenarios·mean_metrics에 학습용 세트 전체의 seed별·평균 지표가 있다.
+    """
+    started = time.time()
+    rows, first = [], None
+    for scenario in scenario_set["train"]:
+        instance, decisions, result = execute(engine, params, scenario["seed"], scenario["faults"])
+        if first is None:
+            first = (instance, decisions, result)
+        rows.append({**scenario, **{k: result[k] for k in ("items", "status_counts", "reason_counts", "metrics",
+                                                              "violations")}})
+    instance, decisions, result = first
+    names = sorted(rows[0]["metrics"])
+    return instance, decisions, {
+        **result,
+        "scenario_set": scenario_set["name"],
+        "primary": primary(scenario_set),
+        "scenarios": rows,
+        "mean_metrics": {m: sum(r["metrics"][m] for r in rows) / len(rows) for m in names},
+        "violations_total": sum(r["violations"] for r in rows),
+        "seconds": time.time() - started,
+    }
+
+
 # --- 2. 결과분석 (AI + 코드) --------------------------------------------------------
 
 def analyze(engine: Engine, params: dict, instance, decisions, llm, llm_config: dict, max_calls: int) -> dict:
     report = core_analyze(engine.pack_factory(params), instance, decisions, llm, llm_config, max_calls=max_calls)
+    return check_report(report)
+
+
+def check_report(report: dict) -> dict:
+    """단일·멀티 분석 리포트 공통: 제출되지 않았거나 근거 있는 발견이 없으면 진행할 수 없다."""
     if report["stop"] != "submitted":
         raise StageError(f"분석 agent가 리포트를 제출하지 않음 (stop={report['stop']})")
     if not report["findings"]:
@@ -55,10 +90,13 @@ def analyze(engine: Engine, params: dict, instance, decisions, llm, llm_config: 
 
 # --- 3. 개선안 도출 (AI + 코드) -----------------------------------------------------
 
-def propose(engine: Engine, params: dict, instance, report: dict, llm, llm_config: dict, max_calls: int) -> dict:
+def propose(engine: Engine, params: dict, instance, report: dict, llm, llm_config: dict, max_calls: int,
+            salt: str = "", feedback: list[str] | None = None) -> dict:
+    """salt: 재시도 때 같은 요청이 LLM 캐시에서 같은 답으로 돌아오지 않게 시도마다 바꾼다.
+    feedback: 앞 시도의 개선안이 탈락한 이유 (코어 propose가 입력 끝에 붙인다)."""
     pack = engine.pack_factory(params)
     out = core_propose(engine.pack_factory, instance, params, engine.spec_text(), pack.dimensions(), report,
-                       llm, llm_config, max_calls=max_calls)
+                       llm, llm_config, salt=salt, max_calls=max_calls, feedback=feedback)
     if out["stop"] != "submitted":
         raise StageError(f"개선 agent가 개선안을 제출하지 않음 (stop={out['stop']})")
     proposals = []
@@ -71,44 +109,61 @@ def propose(engine: Engine, params: dict, instance, report: dict, llm, llm_confi
     return {**out, "proposals": proposals}
 
 
-# --- 4. 검증 (코드) ---------------------------------------------------------------
-# M1: 같은 시나리오에서 simulate_params 1회 비교. 여러 seed·검증용 세트·판정 기준은 M2.
+def rejection_feedback(proposed: dict, validated: dict) -> list[str]:
+    """탈락한 시도에서 개선안마다 왜 떨어졌는지 (다음 시도의 개선 agent에게 준다)."""
+    titles = {p["id"]: p["proposal"].get("title", "") for p in proposed["proposals"]}
+    lines = [f"{s['id']} {titles.get(s['id'], '')}: 허용 범위·대상 검사 탈락 - {'; '.join(s['errors'])}"
+             for s in validated["skipped"]]
+    lines += [f"{c['id']} {c['title']}: 판정 탈락 - {'; '.join(c['reasons'])}" for c in validated["candidates"]
+              if not c["eligible"]]
+    return lines
 
-def validate(engine: Engine, params: dict, instance, report: dict, proposed: dict) -> dict:
+
+# --- 4. 검증 (코드) ---------------------------------------------------------------
+# M2: 개선안마다 학습용·검증용 세트의 모든 시나리오에서 챔피언(전) 대 도전자(후)를 비교하고 판정 기준을 적용한다.
+
+def validate(engine: Engine, params: dict, report: dict, proposed: dict, scenario_set: dict, criteria: dict,
+             time_budget_s: float | None = None) -> dict:
+    started = time.time()
     slices = finding_slices(report)
+    pack = engine.pack_factory(params)
+    instances: dict[tuple, object] = {}
+
+    def instance_of(scenario: dict):
+        key = (scenario["seed"], tuple(scenario["faults"]))
+        if key not in instances:
+            instances[key] = pack.generate(scenario["seed"], scenario["faults"])[0]
+        return instances[key]
+
     candidates = []
     for item in proposed["proposals"]:
         if item["errors"]:
             continue
-        sim = simulate_params(engine.pack_factory, instance, params, apply_params(params, item["proposal"]), slices)
-        reasons = [] if sim["violations_after"] == 0 else [f"필수조건 위반 {sim['violations_after']}건"]
-        candidates.append({"id": item["id"], "title": item["proposal"].get("title", ""),
-                           "simulation": sim, "eligible": not reasons, "reasons": reasons})
+        candidate = apply_params(params, item["proposal"])
+        sets, exceeded = {}, False
+        for name in SETS:
+            rows = []
+            for scenario in scenario_set[name]:
+                if time_budget_s is not None and time.time() - started > time_budget_s:
+                    exceeded = True
+                    break
+                sim = simulate_params(engine.pack_factory, instance_of(scenario), params, candidate, slices)
+                rows.append({**scenario, "before": sim["before"], "after": sim["after"],
+                             "violations_after": sim["violations_after"], "slices": sim["slices"],
+                             "seconds": sim["seconds"]})
+            sets[name] = {"scenarios": rows}
+        verdict = judge({**sets, "budget_exceeded": exceeded}, criteria)
+        for name in SETS:
+            sets[name]["summary"] = verdict["summary"].get(name)
+        candidates.append({"id": item["id"], "title": item["proposal"].get("title", ""), "sets": sets,
+                           "judgement": {k: verdict[k] for k in ("passed", "checks", "reasons")},
+                           "eligible": verdict["passed"], "reasons": verdict["reasons"]})
     return {
-        "method": "simulate_params x1 (same scenario)",
-        "criteria": ["violations_after == 0"],
+        "method": "simulate_params per scenario (train + validation)",
+        "scenario_set": scenario_set["name"],
+        "criteria": criteria,
         "skipped": [{"id": p["id"], "errors": p["errors"]} for p in proposed["proposals"] if p["errors"]],
         "candidates": candidates,
         "eligible": [c["id"] for c in candidates if c["eligible"]],
+        "seconds": time.time() - started,
     }
-
-
-# --- 5. 개선적용 (사람 + 코드) ------------------------------------------------------
-
-def apply(engine: Engine, proposal: dict) -> dict:
-    """승인된 params 개선안을 엔진의 params 파일에 쓰고 version을 올린다."""
-    current = engine.load_params()
-    dims = engine.pack_factory(current).dimensions()
-    errors = params_errors(current, proposal, dims)
-    if errors:
-        raise StageError("현재 params에 적용할 수 없음: " + "; ".join(errors))
-    original = engine.params_path.read_text(encoding="utf-8")
-    before_version, after_version = write_params(engine.params_path, proposal)
-    written = engine.load_params()
-    problems = check_params(written, dims)
-    if problems:
-        engine.params_path.write_text(original, encoding="utf-8")   # 되돌리고 실패로 남긴다
-        raise StageError("반영 후 params 검사 실패: " + "; ".join(problems))
-    return {"params_path": str(engine.params_path),
-            "version_before": before_version, "version_after": after_version,
-            "model_before": f"{engine.name}@v{before_version}", "model_after": model_version(engine, written)}

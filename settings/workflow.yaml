@@ -1,12 +1,27 @@
 # 워크플로우 설정. 상한·기본값은 코드가 아니라 이 파일에서 읽는다.
-# M1 범위: 단계별 LLM 호출 상한, 기본 시나리오(단일 seed). 판정 기준·시나리오 세트·루프 반복은 M2.
+# 분석 방식, 시나리오 세트, 판정 기준, 단계별 LLM 호출·재시도·시간 상한.
 
 engine: rule
 
-scenario:                 # 1단계 실행에 쓰는 시나리오 (CLI --seed, --faults가 우선)
-  seed: 42
-  faults: [P1, P2, P3, P4]
+analysis_mode: single    # single: 단일 분석 agent | multi: 관점 agent 4개 + 종합 (X2, settings/analysis.yaml). CLI --analysis가 우선
+
+scenario_set: default     # scenarios/<이름>.yaml (CLI --scenario가 우선). 분석·개선안 도출은 train의 첫 시나리오
+
+# 판정 기준 (M2). 수치는 사람이 정한다 (2026-10-04 결정). 필수조건 위반 0건은 설정과 무관한 절대 기준.
+criteria:
+  target:
+    metric: assignment_rate
+    direction: higher           # higher | lower
+    min_delta: 0.01             # 평균 +1%p 이상
+    sets: [train, validation]   # 이 세트들 모두에서 평균 개선이 min_delta 이상
+    seed_majority: [validation] # 이 세트에서는 시나리오 과반이 개선돼야 함
+  side_effects: []              # 판정에 쓰지 않고 비교표에만 기록 (결정: 한도 없음)
+  # 예: - {metric: desired_time_match_rate, direction: higher, max_worsening: 0.05, sets: [validation]}
 
 limits:
   analyze_max_llm_calls: 30   # 2단계 분석 agent의 도구 루프 상한 (코어 analyze max_calls)
   propose_max_llm_calls: 20   # 3단계 개선 agent의 도구 루프 상한 (코어 propose max_calls)
+  perspective_max_llm_calls: 15   # 멀티에이전트 분석: 관점 agent 하나의 도구 루프 상한
+  synthesis_max_llm_calls: 3      # 멀티에이전트 분석: 종합 agent의 상한 (도구 없이 제출·수정만)
+  validation_time_budget_s: 300   # 4단계 검증 시간 예산. 넘기면 남은 후보는 판정 탈락
+  max_retries: 1              # 4단계 검증에서 승인 후보가 없을 때 3단계로 되돌리는 횟수 상한 (판정 탈락 포함)

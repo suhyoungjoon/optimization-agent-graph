@@ -1,0 +1,12 @@
+{
+ "version": 1,
+ "history": [
+  {
+   "version": 1,
+   "action": "bootstrap",
+   "at": 1791092705.481548,
+   "by": "bootstrap",
+   "note": "초기 버전"
+  }
+ ]
+}

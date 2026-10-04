@@ -8,9 +8,12 @@ version = "0.1.0"
 description = "Workflow agent that improves optimization engines: run, analyze, propose, validate, apply"
 requires-python = ">=3.11"
 dependencies = [
-    # 코어는 커밋으로 고정한다 (코어 레포에 태그가 없음). 올릴 때는 docs/handoff.md도 같은 커밋으로 갱신
-    "optimization-agent-harness @ git+https://github.com/suhyoungjoon/optimization-agent-harness.git@1343534966ee7743b095a04e4fa00aad79576b42",
+    # 코어는 커밋으로 고정한다 (코어 main, PR #20 머지 커밋. 태그 없음). 올릴 때는 docs/handoff.md도 같은 커밋으로 갱신
+    "optimization-agent-harness @ git+https://github.com/suhyoungjoon/optimization-agent-harness.git@66b9d77c2336efd4b64240a9e23e9d759d3a1361",
     "pyyaml>=6.0",
+    # X1 오케스트레이션. 버전별 API 차이가 있어 고정한다 (올릴 때는 interrupt·Command·SqliteSaver를 다시 확인)
+    "langgraph==1.2.12",
+    "langgraph-checkpoint-sqlite==3.1.1",
 ]
 
 [project.optional-dependencies]
@@ -19,7 +22,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["workflow*", "engines*"]   # core·domains·api·scripts·configs는 코어 패키지 이름이라 쓰지 않는다
+include = ["workflow*", "engines*", "modelreg*"]   # core·domains·api·scripts·configs는 코어 패키지 이름이라 쓰지 않는다
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml"]

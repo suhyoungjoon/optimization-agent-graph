@@ -1,0 +1,26 @@
+# 멀티에이전트 분석(X2)의 관점 agent 정의. dispatch 도메인 지식이라 코드가 아니라 설정에 둔다.
+# 실행마다 이 정의가 run.json에 복사된다 (재현·재개용). 모드 선택은 workflow.yaml의 analysis_mode 또는 CLI --analysis.
+# tools: 코어 Aggregator 도구(overview, aggregate, list_items, count_by_decision_field)와
+#        도메인 팩 analysis_tools(dispatch: worker_stats, demand_by_hour) 중에서 고른다.
+
+perspectives:
+  - id: time_branch
+    prefix: T
+    name: 시간대·지점
+    focus: 시간대(hour)와 지점(branch) 조합에서 실패가 몰리는 구간을 찾는다. 수요와 근무 가능 인력의 차이도 본다.
+    tools: [overview, aggregate, list_items, demand_by_hour]
+  - id: cert_skill
+    prefix: Q
+    name: 자격·스킬
+    focus: 기술·자격 부족(사유 코드 NO_CERT, NO_SKILL 등)으로 인한 실패를 찾는다. 지점별 작업자 자격 분포와 대조한다.
+    tools: [overview, aggregate, count_by_decision_field, worker_stats]
+  - id: utilization
+    prefix: U
+    name: 작업자 활용률
+    focus: 실패 건수에는 드러나지 않는 자원 쪽 패턴을 찾는다. 가용 인력인데 배정이 적은 작업자, 가능시간과 수요 시간대의 불일치를 본다.
+    tools: [overview, worker_stats, demand_by_hour]
+  - id: region
+    prefix: G
+    name: 지역·경계
+    focus: 관할 경계 지역(area_zone)과 지점 경계에서의 실패를 찾는다.
+    tools: [overview, aggregate, list_items]
