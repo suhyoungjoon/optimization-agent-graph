@@ -24,7 +24,9 @@ from engines import Engine
 
 from . import stages
 from .machine import STAGE_FILES, transition
-from .runner import engine_of, new_run, params_digest
+from .locks import file_lock
+from .runner import engine_of, new_run
+from .stages import params_digest
 from .store import RunStore
 
 CHECKPOINT_DB = "checkpoints.sqlite"
@@ -181,17 +183,26 @@ def build_graph(deps: Deps):
     # --- 5단계 -----------------------------------------------------------------
 
     def apply(state: WorkflowState) -> dict:
+        """반영 전에 'applying' 표시를 남긴다. 반영 후 체크포인트 전에 프로세스가 죽어 이 노드가 다시 돌면,
+        파일이 이미 기대한 결과와 같은지 확인하고 다시 쓰지 않는다 (version이 두 번 오르지 않게)."""
         run_id, decision = state["run_id"], state["decision"]
         if decision["proposal_id"] not in state["validation"]["eligible"]:
             raise stages.StageError(f"검증을 통과한 후보가 아님: {decision['proposal_id']}")
         proposal = next(p["proposal"] for p in store.read(run_id, STAGE_FILES["3_propose"])["proposals"]
                         if p["id"] == decision["proposal_id"])
-        try:
-            applied = stages.apply(deps.engine(run_id), proposal)
-        except Exception as exc:
-            store.write(run_id, STAGE_FILES["5_apply"], {**decision, "error": str(exc)})
-            raise
-        store.write(run_id, STAGE_FILES["5_apply"], {**decision, **applied})
+        engine, champion, run = deps.engine(run_id), deps.champion(run_id), deps.run(run_id)
+        marker = store.read(run_id, STAGE_FILES["5_apply"]) if store.has(run_id, STAGE_FILES["5_apply"]) else {}
+        if marker.get("state") == "applying" and engine.load_params() == stages.expected_after(champion, proposal):
+            applied = {**stages.applied_record(engine, int(champion["version"]), engine.load_params()),
+                       "recovered": True}
+        else:
+            store.write(run_id, STAGE_FILES["5_apply"], {**decision, "state": "applying"})
+            try:
+                applied = stages.apply(engine, proposal, run["params_sha256"])
+            except Exception as exc:
+                store.write(run_id, STAGE_FILES["5_apply"], {**decision, "state": "error", "error": str(exc)})
+                raise
+        store.write(run_id, STAGE_FILES["5_apply"], {**decision, **applied, "state": "applied"})
         return {"status": deps.advance(run_id, "applied", f"{applied['model_before']} → {applied['model_after']}")}
 
     def reject(state: WorkflowState) -> dict:
@@ -254,7 +265,8 @@ def mermaid() -> str:
 
 def run_workflow(store: RunStore, engine: Engine, *, seed: int, faults: list[str], llm, llm_config: dict,
                  limits: dict, rehearsal: bool) -> dict:
-    """1~4단계를 돌고 승인 대기(interrupt)에서 멈춘다. 최종 run(run.json)을 돌려준다."""
+    """1~4단계를 돌고 승인 대기(interrupt)에서 멈춘다. 승인 후보가 없으면 재시도 후 자동 반려(rejected),
+    노드 실패 시 failed로 끝난다. 최종 run(run.json)을 돌려준다."""
     run = new_run(store, engine, seed=seed, faults=faults, llm_model=llm.model, llm_config=llm_config,
                   limits=limits, rehearsal=rehearsal, orchestrator="langgraph")
     store.write(run["run_id"], CHAMPION_FILE, engine.load_params())
@@ -274,10 +286,21 @@ def pending(store: RunStore, run_id: str) -> tuple[str, ...]:
 
 
 def _resume(store: RunStore, run_id: str, decision: dict) -> dict:
-    if pending(store, run_id) != ("approval",):
-        raise ValueError(f"체크포인트가 승인 대기 지점이 아님: {run_id}")
+    """승인 대기(interrupt)를 결정으로 재개한다. 반영 도중 중단돼 체크포인트가 apply 앞이면 그 노드를 이어서 돌린다
+    (이때 결정은 이미 체크포인트에 있으므로 새 결정은 쓰지 않는다)."""
+    nxt = pending(store, run_id)
+    if nxt == ("approval",):
+        command = Command(resume=decision)
+    elif nxt == ("apply",) and decision["decision"] == "approved":
+        with compiled(Deps(store)) as graph:
+            saved = graph.get_state(_config(run_id)).values["decision"]
+        if saved["proposal_id"] != decision["proposal_id"]:
+            raise ValueError(f"중단된 반영은 {saved['proposal_id']} 승인이었음. 같은 후보로 approve 하라")
+        command = None
+    else:
+        raise ValueError(f"체크포인트가 승인 대기 지점이 아님: {run_id} (다음 노드 {nxt})")
     with compiled(Deps(store)) as graph:
-        graph.invoke(Command(resume=decision), _config(run_id))
+        graph.invoke(command, _config(run_id))
     return store.load(run_id)
 
 
@@ -288,23 +311,35 @@ def _awaiting(store: RunStore, run_id: str) -> dict:
     return run
 
 
+def _decision_lock(store: RunStore, run_id: str):
+    """같은 실행의 approve/reject를 한 번에 하나만 재개한다."""
+    return file_lock(store.run_dir(run_id) / ".decision.lock", f"실행 {run_id}의 승인·반려")
+
+
 def approve(store: RunStore, run_id: str, proposal_id: str | None = None, note: str = "") -> dict:
-    run = _awaiting(store, run_id)
-    eligible = store.read(run_id, STAGE_FILES["4_validate"])["eligible"]
-    if proposal_id is None:
-        if len(eligible) != 1:
-            raise ValueError(f"승인 후보가 {len(eligible)}건이므로 --proposal로 지정해야 함: {eligible}")
-        proposal_id = eligible[0]
-    if proposal_id not in eligible:
-        raise ValueError(f"검증을 통과한 후보가 아님: {proposal_id} (후보: {eligible})")
-    if params_digest(engine_of(run)) != run["params_sha256"]:
-        raise ValueError("실행 이후 챔피언 params 파일이 바뀌었으므로 승인할 수 없음. 다시 run 하라: "
-                         + run["params_path"])
-    return _resume(store, run_id, {"decision": "approved", "by": getpass.getuser(), "note": note,
-                                   "proposal_id": proposal_id, "at": time.time()})
+    with _decision_lock(store, run_id):
+        run = _awaiting(store, run_id)
+        eligible = store.read(run_id, STAGE_FILES["4_validate"])["eligible"]
+        if proposal_id is None:
+            if len(eligible) != 1:
+                raise ValueError(f"승인 후보가 {len(eligible)}건이므로 --proposal로 지정해야 함: {eligible}")
+            proposal_id = eligible[0]
+        if proposal_id not in eligible:
+            raise ValueError(f"검증을 통과한 후보가 아님: {proposal_id} (후보: {eligible})")
+        interrupted = (store.has(run_id, STAGE_FILES["5_apply"])
+                       and store.read(run_id, STAGE_FILES["5_apply"]).get("state") == "applying")
+        if not interrupted and params_digest(engine_of(run)) != run["params_sha256"]:
+            raise ValueError("실행 이후 챔피언 params 파일이 바뀌었으므로 승인할 수 없음. 다시 run 하라: "
+                             + run["params_path"])
+        # 반영 도중 중단된 실행은 다시 approve하면 apply 노드가 이어서 돌며, 이미 반영된 파일이면 다시 쓰지 않는다
+        return _resume(store, run_id, {"decision": "approved", "by": getpass.getuser(), "note": note,
+                                       "proposal_id": proposal_id, "at": time.time()})
 
 
 def reject(store: RunStore, run_id: str, note: str = "") -> dict:
-    _awaiting(store, run_id)
-    return _resume(store, run_id, {"decision": "rejected", "by": getpass.getuser(), "note": note,
-                                   "at": time.time()})
+    with _decision_lock(store, run_id):
+        _awaiting(store, run_id)
+        if store.has(run_id, STAGE_FILES["5_apply"]) and store.read(run_id, STAGE_FILES["5_apply"]).get("state") == "applying":
+            raise ValueError(f"반영 도중 중단된 실행이므로 반려할 수 없음. approve {run_id}로 마무리하라")
+        return _resume(store, run_id, {"decision": "rejected", "by": getpass.getuser(), "note": note,
+                                       "at": time.time()})

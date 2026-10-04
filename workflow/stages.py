@@ -3,6 +3,7 @@
 엔진은 engines.Engine 계약으로만 다룬다 (pack_factory, load_params, spec_text, params_path).
 """
 
+import hashlib
 import time
 from collections import Counter
 
@@ -12,6 +13,8 @@ from core import analyze as core_analyze
 from core import propose as core_propose
 
 from engines import Engine, model_version
+
+from .locks import file_lock
 
 TARGET_KIND = "params"   # 엔진이 개선할 수 있는 개선안 종류 (규칙 엔진: params만)
 
@@ -97,20 +100,41 @@ def validate(engine: Engine, params: dict, instance, report: dict, proposed: dic
 
 # --- 5. 개선적용 (사람 + 코드) ------------------------------------------------------
 
-def apply(engine: Engine, proposal: dict) -> dict:
-    """승인된 params 개선안을 엔진의 params 파일에 쓰고 version을 올린다."""
-    current = engine.load_params()
-    dims = engine.pack_factory(current).dimensions()
-    errors = params_errors(current, proposal, dims)
-    if errors:
-        raise StageError("현재 params에 적용할 수 없음: " + "; ".join(errors))
-    original = engine.params_path.read_text(encoding="utf-8")
-    before_version, after_version = write_params(engine.params_path, proposal)
-    written = engine.load_params()
-    problems = check_params(written, dims)
-    if problems:
-        engine.params_path.write_text(original, encoding="utf-8")   # 되돌리고 실패로 남긴다
-        raise StageError("반영 후 params 검사 실패: " + "; ".join(problems))
+def params_digest(engine: Engine) -> str:
+    return hashlib.sha256(engine.params_path.read_bytes()).hexdigest()
+
+
+def expected_after(champion: dict, proposal: dict) -> dict:
+    """champion에 proposal을 반영한 뒤의 params (version +1). 반영이 이미 끝났는지 확인할 때 쓴다."""
+    after = apply_params(champion, proposal)
+    after["version"] = int(champion["version"]) + 1
+    return after
+
+
+def apply(engine: Engine, proposal: dict, expected_sha256: str | None = None) -> dict:
+    """승인된 params 개선안을 엔진의 params 파일에 쓰고 version을 올린다.
+
+    expected_sha256: 실행 시점 params 파일의 해시. 잠금 안에서 다시 확인해, 검사 이후 파일이 바뀌었으면 쓰지 않는다.
+    """
+    with file_lock(engine.params_path.with_name(engine.params_path.name + ".lock"), "params 반영"):
+        if expected_sha256 is not None and params_digest(engine) != expected_sha256:
+            raise StageError(f"실행 이후 챔피언 params 파일이 바뀌었음: {engine.params_path}")
+        current = engine.load_params()
+        dims = engine.pack_factory(current).dimensions()
+        errors = params_errors(current, proposal, dims)
+        if errors:
+            raise StageError("현재 params에 적용할 수 없음: " + "; ".join(errors))
+        original = engine.params_path.read_text(encoding="utf-8")
+        before_version, after_version = write_params(engine.params_path, proposal)
+        written = engine.load_params()
+        problems = check_params(written, dims)
+        if problems:
+            engine.params_path.write_text(original, encoding="utf-8")   # 되돌리고 실패로 남긴다
+            raise StageError("반영 후 params 검사 실패: " + "; ".join(problems))
+    return applied_record(engine, before_version, written)
+
+
+def applied_record(engine: Engine, before_version: int, written: dict) -> dict:
     return {"params_path": str(engine.params_path),
-            "version_before": before_version, "version_after": after_version,
+            "version_before": before_version, "version_after": int(written["version"]),
             "model_before": f"{engine.name}@v{before_version}", "model_after": model_version(engine, written)}

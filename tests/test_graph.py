@@ -163,3 +163,62 @@ def test_mermaid_export(tmp_path):
         assert edge in text
     out = tmp_path / "graph.mmd"
     assert _cli("graph", "--out", str(out)).returncode == 0 and out.read_text(encoding="utf-8") == text
+
+
+class _Crash(BaseException):
+    """프로세스가 죽은 것처럼 그래프 밖으로 빠져나간다 (노드의 Exception 처리에 잡히지 않음)."""
+
+
+def test_crash_after_write_recovers_without_double_apply(tmp_path, llm_config, monkeypatch):
+    store, params = RunStore(tmp_path / "runs"), _params(tmp_path, "params.yaml")
+    run_id = _run(graph, store, params, rehearsal_llm(), llm_config)["run_id"]
+    real_apply = graph.stages.apply
+
+    def apply_then_crash(*args, **kwargs):
+        real_apply(*args, **kwargs)
+        raise _Crash()
+
+    monkeypatch.setattr(graph.stages, "apply", apply_then_crash)
+    with pytest.raises(_Crash):
+        graph.approve(store, run_id)
+    assert yaml.safe_load(params.read_text(encoding="utf-8"))["version"] == 2     # 파일은 이미 바뀜
+    assert store.load(run_id)["status"] == "awaiting_approval"                     # 체크포인트는 승인 대기
+    assert store.read(run_id, STAGE_FILES["5_apply"])["state"] == "applying"
+    with pytest.raises(ValueError, match="반려할 수 없음"):
+        graph.reject(store, run_id)
+
+    monkeypatch.setattr(graph.stages, "apply", real_apply)
+    run = graph.approve(store, run_id)                                             # 같은 결정으로 다시 재개
+    assert run["status"] == "applied"
+    assert yaml.safe_load(params.read_text(encoding="utf-8"))["version"] == 2     # 두 번 오르지 않는다
+    applied = store.read(run_id, STAGE_FILES["5_apply"])
+    assert applied["recovered"] is True and applied["model_after"] == "rule@v2"
+
+
+def test_concurrent_decisions_and_params_writes_are_locked(tmp_path, llm_config):
+    from workflow.locks import LockBusy
+    store, params = RunStore(tmp_path / "runs"), _params(tmp_path, "params.yaml")
+    run_id = _run(graph, store, params, rehearsal_llm(), llm_config)["run_id"]
+    lock = store.run_dir(run_id) / ".decision.lock"
+    lock.write_text("123")                                                         # 다른 approve가 진행 중
+    with pytest.raises(LockBusy):
+        graph.approve(store, run_id)
+    lock.unlink()
+
+    params_lock = params.with_name(params.name + ".lock")
+    params_lock.write_text("123")                                                  # 다른 실행이 같은 params에 반영 중
+    run = graph.approve(store, run_id)
+    assert run["status"] == "failed" and "params 반영" in run["error"]["message"]
+    assert yaml.safe_load(params.read_text(encoding="utf-8"))["version"] == 1
+    params_lock.unlink()
+
+
+def test_params_changed_between_check_and_write_is_refused(tmp_path, llm_config):
+    from workflow import stages
+    params = _params(tmp_path, "params.yaml")
+    engine = get_engine("rule", params)
+    digest = stages.params_digest(engine)
+    params.write_text(params.read_text(encoding="utf-8") + "\n# 바뀜\n", encoding="utf-8")
+    with pytest.raises(stages.StageError, match="바뀌었음"):
+        stages.apply(engine, GOOD, digest)
+    assert yaml.safe_load(params.read_text(encoding="utf-8"))["version"] == 1

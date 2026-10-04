@@ -4,7 +4,6 @@ CLI는 X1부터 workflow.graph(LangGraph)를 쓴다. 이 모듈은 동등성 테
 """
 
 import getpass
-import hashlib
 import json
 import time
 import traceback
@@ -16,6 +15,7 @@ from engines import Engine, get_engine, model_version
 
 from . import stages
 from .machine import STAGE_FILES, TERMINAL, transition
+from .stages import params_digest
 from .store import RunStore
 
 CORE_DIST = "optimization-agent-harness"
@@ -31,10 +31,6 @@ def core_ref() -> dict:
         info["url"] = data.get("url")
         info["commit"] = (data.get("vcs_info") or {}).get("commit_id")
     return info
-
-
-def params_digest(engine: Engine) -> str:
-    return hashlib.sha256(engine.params_path.read_bytes()).hexdigest()
 
 
 def engine_of(run: dict) -> Engine:
@@ -138,14 +134,14 @@ def approve(store: RunStore, run_id: str, proposal_id: str | None = None, note: 
     record = {"decision": "approved", "by": getpass.getuser(), "note": note, "proposal_id": proposal_id,
               "at": time.time()}
     try:
-        applied = stages.apply(engine, proposal)
+        applied = stages.apply(engine, proposal, run["params_sha256"])
     except Exception as exc:  # noqa: BLE001
         run["error"] = {"type": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc(limit=8)}
         store.write(run_id, STAGE_FILES["5_apply"], {**record, "error": str(exc)})
         transition(run, "failed", str(exc))
         store.save(run)
         return run
-    store.write(run_id, STAGE_FILES["5_apply"], {**record, **applied})
+    store.write(run_id, STAGE_FILES["5_apply"], {**record, **applied, "state": "applied"})
     transition(run, "applied", f"{applied['model_before']} → {applied['model_after']}")
     store.save(run)
     return run
