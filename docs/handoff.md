@@ -36,7 +36,7 @@ from domains.dispatch import get_pack                                           
 
 - **확실히 동작 (결정적, 테스트 고정)**: 데이터 생성, 규칙 엔진 solve/validate, 지표, 차원 집계, 허용 범위 검사, params 시뮬레이션, 정답표 채점, params 파일 반영·버전 올림, 저장소.
 - **흐름은 동작, 품질 미검증**: AI agent(L0~L5), 분석 agent, 개선 agent. 테스트는 모두 `tests/fake_llm.py`의 가짜 LLM이다. **실제 Claude API로 돌린 실험 결과는 아직 없다.**
-- 테스트: pytest 164개(이 인수인계 작업에서 공개 API 테스트 2개 추가), GitHub Actions에서 ubuntu·windows 매트릭스 + 웹 빌드.
+- 테스트: pytest 167개(인수인계 작업에서 공개 API 테스트 2개, 재사용 레포 요청으로 공개 API 보강 테스트 3개 추가), GitHub Actions에서 ubuntu·windows 매트릭스 + 웹 빌드.
 
 ## 2. 재사용 대상 모듈
 
@@ -156,7 +156,8 @@ class LLMClient(Protocol):
     model: str
     def create(self, *, system: list[dict], messages: list[dict], tools: list[dict], salt: str = "") -> LLMResponse
 class AnthropicClient:            # 실제 호출은 여기서만. thinking=adaptive, effort는 llm.yaml
-    def __init__(self, config: dict | None = None, cache: ResponseCache | None = None, api: Any = None)
+    def __init__(self, config: dict | None = None, cache: ResponseCache | None = None, api: Any = None,
+                 env_path: str | Path | None = None)   # env_path: API 키를 읽을 .env (없으면 패키지 위치의 .env)
 class ResponseCache:              # 요청+salt 해시 → 응답 (SQLite)
     def __init__(self, path=<패키지 위치>/runs/llm_cache.sqlite)
 class Usage: calls, cached_calls, tokens; add(resp); merge(other); cost_usd(model, config); to_dict(model, config)
@@ -174,8 +175,8 @@ def run_tool_loop(llm, *, system: str, user: str, tools: list[dict], submit_tool
 
 | 모듈 | 공개 이름 | 역할 |
 |---|---|---|
-| `core/analysis/agent.py` | `analyze(pack, instance, decisions, llm, llm_config, salt="", max_calls=30) -> dict` | 분석 agent. 발견의 수치가 인용한 도구 결과에 없으면 제외(`core/analysis/grounding.py`) |
-| `core/improvement/proposer.py` | `propose(pack_factory, instance, params, spec_text, dimensions, report, llm, llm_config, salt="", max_calls=20) -> dict`, `finding_slices(report)` | 개선 agent. `simulate_params`를 도구로 쓰고, 제출안을 `params_errors`/`spec_errors`로 재검사 |
+| `core/analysis/agent.py` | `analyze(pack, instance, decisions, llm, llm_config, salt="", max_calls=30) -> dict`, `report_submit_tool(dimensions, metric_names)`, `grounding_problems(finding, calls)` | 분석 agent. 발견의 수치가 인용한 도구 결과에 없으면 제외(`core/analysis/grounding.py`). 리포트 제출 도구 정의와 발견 하나의 근거 검사를 공개해 다른 분석 agent(관점별 agent 등)도 같은 형식·검사를 쓸 수 있다 |
+| `core/improvement/proposer.py` | `propose(pack_factory, instance, params, spec_text, dimensions, report, llm, llm_config, salt="", max_calls=20, feedback=None) -> dict`, `finding_slices(report)` | 개선 agent. `simulate_params`를 도구로 쓰고, 제출안을 `params_errors`/`spec_errors`로 재검사. `feedback`(앞선 시도의 탈락 이유 목록)을 주면 입력 끝에 붙인다(없으면 입력·캐시 키가 이전과 같다) |
 | `core/evaluation/fault_scorer.py` | `score(findings, faults) -> dict`, `matches(finding, answer)` | 정답표 대조 탐지율 |
 | `core/evaluation/runner.py` | `run_rule_agent(store, pack, dataset, params, scope=None, group_id=None) -> run_id`, `run_ai_agent(...)`, `create_ai_run(...)` | 실행 + validate + metrics + 저장 |
 | `core/evaluation/compare.py` | `compare(store, run_ids) -> dict`, `consistency(store, run_ids)` | 실행 간 비교표, 반복 실행 일관성 |
@@ -442,7 +443,7 @@ overrides:                        # 구간 조건
 
 **경로와 파일 쓰기**
 
-- `configs/`, `runs/`(LLM 캐시·DB 기본 위치), `.env`, 도메인 `params.yaml`·`domain-spec.md`의 기본 경로가 **패키지 설치 위치 기준**이다. 일반 설치에서 기본값을 쓰면 site-packages 안을 읽고 쓴다. 새 레포에서는 경로를 인자로 넘길 것: `load_levels(path)`, `load_config(path)`, `AnthropicClient(cache=ResponseCache(path))`, `Store(path)`, `write_params(자기 params 경로, ...)`.
+- `configs/`, `runs/`(LLM 캐시·DB 기본 위치), `.env`, 도메인 `params.yaml`·`domain-spec.md`의 기본 경로가 **패키지 설치 위치 기준**이다. 일반 설치에서 기본값을 쓰면 site-packages 안을 읽고 쓴다. 새 레포에서는 경로를 인자로 넘길 것: `load_levels(path)`, `load_config(path)`, `AnthropicClient(cache=ResponseCache(path), env_path=자기 .env)`, `Store(path)`, `write_params(자기 params 경로, ...)`.
 - `.env.example`의 `LLM_MODEL`은 코드에서 읽지 않는다(모델은 `llm.yaml`의 `model`).
 
 **구조**
@@ -489,7 +490,7 @@ pip install -e "/path/to/optimization-agent-harness[dev]"  # 편집 모드 + 테
 
 ```bash
 pip install -e ".[dev]"
-pytest                                   # 164개, LLM·네트워크 없음 (약 50초)
+pytest                                   # 167개, LLM·네트워크 없음 (약 50초)
 python examples/reuse_quickstart.py      # 재사용 확인
 (cd web && npm ci && npm run build)      # 프런트엔드 (재사용 대상 아님)
 ```
