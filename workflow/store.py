@@ -13,6 +13,7 @@ from typing import Any
 from core import to_jsonable
 
 RUN_FILE = "run.json"
+TIMINGS_DIR = "timings"
 _RUN_ID = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_-]*$")
 
 
@@ -53,6 +54,20 @@ class RunStore:
 
     def read(self, run_id: str, filename: str) -> Any:
         return json.loads((self.run_dir(run_id) / filename).read_text(encoding="utf-8"))
+
+    def record_timing(self, run_id: str, record: dict) -> None:
+        """노드 실행 시간 기록. 병렬 노드가 동시에 쓰므로 노드마다 파일 하나 (timings/)."""
+        directory = self.run_dir(run_id) / TIMINGS_DIR
+        directory.mkdir(exist_ok=True)
+        name = f"{record['started_at']:.6f}-{record['node']}-{secrets.token_hex(2)}.json"
+        (directory / name).write_text(json.dumps(to_jsonable(record), ensure_ascii=False), encoding="utf-8")
+
+    def timings(self, run_id: str) -> list[dict]:
+        directory = self.run_dir(run_id) / TIMINGS_DIR
+        if not directory.is_dir():
+            return []
+        records = [json.loads(p.read_text(encoding="utf-8")) for p in directory.glob("*.json")]
+        return sorted(records, key=lambda r: r["started_at"])
 
     def has(self, run_id: str, filename: str) -> bool:
         return (self.run_dir(run_id) / filename).is_file()

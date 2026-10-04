@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workflow Graph</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <h1>optimization-agent-graph <span class="sub">LangGraph 워크플로우</span></h1>
+  <div id="stats" class="stats"></div>
+</header>
+<main class="layout">
+  <aside class="side">
+    <section class="card">
+      <h2>새 리허설 실행 <span class="hint">가짜 LLM · 비용 없음</span></h2>
+      <form id="start-form" class="form">
+        <label>시나리오 세트 <select id="start-scenario"></select></label>
+        <label>분석 방식
+          <select id="start-analysis">
+            <option value="single">single (단일 agent)</option>
+            <option value="multi">multi (관점 agent 4개 + 종합)</option>
+          </select>
+        </label>
+        <button type="submit">실행 시작</button>
+        <p class="hint">실제 API 실행은 CLI에서만 한다.</p>
+      </form>
+    </section>
+    <section class="card">
+      <h2>실행 목록</h2>
+      <ul id="runs" class="runs"></ul>
+    </section>
+    <section class="card">
+      <h2>모델 레지스트리</h2>
+      <div id="models"></div>
+    </section>
+  </aside>
+  <section class="content">
+    <div id="empty" class="card empty">왼쪽에서 실행을 고르거나 리허설 실행을 시작한다.</div>
+    <div id="detail" hidden>
+      <section class="card">
+        <div id="run-head"></div>
+        <div id="banner"></div>
+      </section>
+      <section class="card">
+        <h2>그래프 <span class="hint">컴파일된 LangGraph 그래프 · 진한 선 = 이번 실행 경로 · 점선 = 조건부 엣지</span></h2>
+        <div class="legend">
+          <span class="dot ai"></span>AI+코드 <span class="dot code"></span>코드 <span class="dot human"></span>사람
+          <span class="sep"></span><span class="badge done">✓ 실행됨</span><span class="badge paused">⏸ interrupt</span>
+          <span class="badge running">● 실행 중</span><span class="badge failed">✗ 실패</span>
+        </div>
+        <div class="graph-wrap"><svg id="graph"></svg></div>
+      </section>
+      <section class="split">
+        <div class="card">
+          <h2>체크포인트 타임라인 <span class="hint" id="thread"></span></h2>
+          <div id="timeline"></div>
+        </div>
+        <div class="card">
+          <h2>그래프 상태 <span class="hint" id="state-title"></span></h2>
+          <div id="state"></div>
+        </div>
+      </section>
+      <section class="card">
+        <h2 id="node-title">노드 상세</h2>
+        <div id="node-detail" class="hint">그래프에서 노드를 누르면 단계 결과가 여기에 펼쳐진다.</div>
+      </section>
+    </div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

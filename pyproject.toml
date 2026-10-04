@@ -14,18 +14,22 @@ dependencies = [
     # X1 오케스트레이션. 버전별 API 차이가 있어 고정한다 (올릴 때는 interrupt·Command·SqliteSaver를 다시 확인)
     "langgraph==1.2.12",
     "langgraph-checkpoint-sqlite==3.1.1",
+    # M3 화면 서버 (코어 패키지가 이미 설치하는 라이브러리지만 이 레포가 직접 쓰므로 명시)
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "httpx>=0.27",      # FastAPI TestClient (ui 테스트)
 ]
 
 [tool.setuptools.packages.find]
-include = ["workflow*", "engines*", "modelreg*"]   # core·domains·api·scripts·configs는 코어 패키지 이름이라 쓰지 않는다
+include = ["workflow*", "engines*", "modelreg*", "ui*"]   # core·domains·api·scripts·configs는 코어 패키지 이름이라 쓰지 않는다
 
 [tool.setuptools.package-data]
-"*" = ["*.yaml"]
+"*" = ["*.yaml", "static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
