@@ -37,6 +37,11 @@ def _tool_outputs(messages):
             for b in m["content"] if b.get("type") == "tool_result" and not b.get("is_error")]
 
 
+def _turn(messages) -> int:
+    """이 대화에서 지금까지 LLM이 답한 횟수. FakeLLM의 n은 분석·제안 대화를 합쳐 세므로 쓰지 않는다."""
+    return sum(1 for m in messages if m["role"] == "assistant")
+
+
 def _analyst(n, messages):
     if n < len(ANALYST_QUERIES):
         return tool_use(*ANALYST_QUERIES[n])
@@ -57,19 +62,24 @@ def _analyst(n, messages):
     ]})
 
 
-def build_policy(proposals=DEFAULT_PROPOSALS):
+def build_policy(proposals=DEFAULT_PROPOSALS, *retries):
+    """proposals: 첫 제안 시도의 개선안. retries: 재시도마다 낼 개선안 (모자라면 마지막을 반복)."""
+    attempts = [list(proposals), *[list(r) for r in retries]]
+    submitted = []
+
     def policy(item, n, messages, tools):
         names = {t["name"] for t in tools}
         if "submit_report" in names:
-            return _analyst(n, messages)
+            return _analyst(_turn(messages), messages)
         if "submit_proposals" in names:
-            if n == 0:
+            if _turn(messages) == 0:
                 return tool_use("simulate_params", {"override_rules": [BOUNDARY_RULE]})
-            return tool_use("submit_proposals", {"proposals": list(proposals)})
+            submitted.append(1)
+            return tool_use("submit_proposals", {"proposals": attempts[min(len(submitted), len(attempts)) - 1]})
         raise AssertionError(f"리허설 시나리오에 없는 호출: {sorted(names)}")
 
     return policy
 
 
-def rehearsal_llm(proposals=DEFAULT_PROPOSALS) -> FakeLLM:
-    return FakeLLM(build_policy(proposals))
+def rehearsal_llm(proposals=DEFAULT_PROPOSALS, *retries) -> FakeLLM:
+    return FakeLLM(build_policy(proposals, *retries))
