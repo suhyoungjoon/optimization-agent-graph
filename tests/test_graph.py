@@ -151,8 +151,9 @@ def test_reject_records_only(store, registry, llm_config):
 
 def _cli(*args):
     env = {**os.environ, "PYTHONPATH": str(REPO)}
+    # CLI는 UTF-8로 출력한다 (workflow/__main__.py). 읽는 쪽도 로캘 코덱(Windows cp1252)이 아니라 UTF-8로 읽는다
     return subprocess.run([sys.executable, "-m", "workflow", *args], cwd=REPO, env=env, capture_output=True,
-                          text=True, timeout=300)
+                          text=True, encoding="utf-8", timeout=300)
 
 
 def test_resume_from_checkpoint_in_new_process(tmp_path, registry):
