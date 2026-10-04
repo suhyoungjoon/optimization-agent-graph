@@ -55,10 +55,12 @@ def analyze(engine: Engine, params: dict, instance, decisions, llm, llm_config: 
 
 # --- 3. 개선안 도출 (AI + 코드) -----------------------------------------------------
 
-def propose(engine: Engine, params: dict, instance, report: dict, llm, llm_config: dict, max_calls: int) -> dict:
+def propose(engine: Engine, params: dict, instance, report: dict, llm, llm_config: dict, max_calls: int,
+            salt: str = "") -> dict:
+    """salt: 재시도 때 같은 요청이 LLM 캐시에서 같은 답으로 돌아오지 않게 시도마다 바꾼다."""
     pack = engine.pack_factory(params)
     out = core_propose(engine.pack_factory, instance, params, engine.spec_text(), pack.dimensions(), report,
-                       llm, llm_config, max_calls=max_calls)
+                       llm, llm_config, salt=salt, max_calls=max_calls)
     if out["stop"] != "submitted":
         raise StageError(f"개선 agent가 개선안을 제출하지 않음 (stop={out['stop']})")
     proposals = []

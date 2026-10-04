@@ -4,6 +4,7 @@
     python -m workflow approve <run_id> [--proposal C1] [--note "..."]
     python -m workflow reject <run_id> [--note "..."]
     python -m workflow status [<run_id>]
+    python -m workflow graph [--out workflow-graph.mmd]
 
 경로 기본값은 이 레포 기준이다 (runs/, settings/). 코어에는 경로를 항상 인자로 넘긴다.
 """
@@ -17,7 +18,7 @@ import yaml
 
 from engines import get_engine
 
-from . import runner
+from . import graph, runner
 from .store import RunStore
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -78,6 +79,11 @@ def _print_summary(info: dict) -> None:
         print(f"  다음: python -m workflow approve {info['run_id']}  또는  reject {info['run_id']} --note '사유'")
 
 
+def _orchestrator(store: RunStore, run_id: str):
+    """X1 이전(M1 러너)으로 만든 실행은 체크포인트가 없으므로 M1 방식으로 승인·반려한다."""
+    return graph if store.load(run_id).get("orchestrator") == "langgraph" else runner
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m workflow")
     parser.add_argument("--runs-dir", type=Path, default=DEFAULT_RUNS)
@@ -101,6 +107,9 @@ def main(argv: list[str] | None = None) -> int:
     p_no.add_argument("run_id")
     p_no.add_argument("--note", default="")
 
+    p_gr = sub.add_parser("graph", help="워크플로우 그래프를 Mermaid로 내보낸다")
+    p_gr.add_argument("--out", type=Path, help="저장할 파일 (생략하면 화면에 출력)")
+
     p_st = sub.add_parser("status", help="실행 상태와 단계별 결과")
     p_st.add_argument("run_id", nargs="?")
     p_st.add_argument("--json", action="store_true")
@@ -117,13 +126,21 @@ def main(argv: list[str] | None = None) -> int:
             faults = ([f for f in args.faults.split(",") if f] if args.faults is not None
                       else list(settings["scenario"]["faults"]))
             llm, llm_config = _make_llm(args.settings_dir, args.runs_dir, args.rehearsal)
-            run = runner.run_workflow(store, engine, seed=seed, faults=faults, llm=llm, llm_config=llm_config,
+            run = graph.run_workflow(store, engine, seed=seed, faults=faults, llm=llm, llm_config=llm_config,
                                       limits=settings["limits"], rehearsal=args.rehearsal)
             run_id = run["run_id"]
         elif args.command == "approve":
-            run_id = runner.approve(store, args.run_id, args.proposal, args.note)["run_id"]
+            run_id = _orchestrator(store, args.run_id).approve(store, args.run_id, args.proposal, args.note)["run_id"]
         elif args.command == "reject":
-            run_id = runner.reject(store, args.run_id, args.note)["run_id"]
+            run_id = _orchestrator(store, args.run_id).reject(store, args.run_id, args.note)["run_id"]
+        elif args.command == "graph":
+            text = graph.mermaid()
+            if args.out:
+                args.out.write_text(text, encoding="utf-8")
+                print(f"Mermaid 그래프를 {args.out}에 저장했다")
+            else:
+                print(text)
+            return 0
         else:
             if not args.run_id:
                 for r in store.list_runs():

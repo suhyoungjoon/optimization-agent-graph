@@ -50,7 +50,7 @@ runs/            실행 결과·DB·LLM 캐시 (git 제외)
 
 ## 기술 스택
 
-Python 3.11+, 코어 패키지(`optimization-agent-harness`), PyYAML, pytest. LLM은 코어의 `AnthropicClient`·`run_tool_loop`을 쓴다. UI는 M3에서 결정 (코어 레포의 React UI는 재사용하지 않음).
+Python 3.11+, 코어 패키지(`optimization-agent-harness`), LangGraph(`langgraph`·`langgraph-checkpoint-sqlite`, 버전 고정, 오케스트레이션에만 사용), PyYAML, pytest. LLM은 코어의 `AnthropicClient`·`run_tool_loop`을 쓴다. UI는 M3에서 결정 (코어 레포의 React UI는 재사용하지 않음).
 
 ## 개발 규칙
 
@@ -70,7 +70,10 @@ python -m workflow run --seed 7 --faults P1,P4 --params <params 경로> --rehear
 python -m workflow status [<run_id>]                     # 실행 목록 / 단계별 결과
 python -m workflow approve <run_id> [--proposal C1]      # 사람 승인 → params version +1
 python -m workflow reject <run_id> --note "사유"          # 사람 반려 (기록만)
+python -m workflow graph [--out <파일>]                   # 워크플로우 그래프를 Mermaid로 내보냄
 ```
+X1부터 `run`은 LangGraph 그래프(`workflow/graph.py`)로 돈다. 승인 대기는 interrupt이고, 체크포인트는 `runs/checkpoints.sqlite`(thread_id = run_id)에 남는다. `approve`·`reject`는 다른 프로세스에서 같은 실행을 재개한다. 단계 결과의 기준은 여전히 `runs/<run_id>/`의 JSON 파일이다.
+`workflow/runner.py`(M1 상태 머신)는 동등성 테스트의 기준으로 남아 있다.
 M1에서는 시나리오를 `--seed`·`--faults`(기본값 `settings/workflow.yaml`)로 지정한다. `--scenario train`(시나리오 세트)은 M2.
 기본 params 파일은 `engines/rule/params.yaml`이다. 리허설에서 이 파일을 바꾸지 않으려면 복사본을 `--params`로 넘긴다.
 (명령이 바뀌면 이 섹션을 갱신한다.)

@@ -1,4 +1,7 @@
-"""워크플로우 실행: 1~4단계를 돌고 승인 대기에서 멈춘다. 5단계는 사람의 approve/reject로만 진행한다."""
+"""M1 워크플로우 러너: 1~4단계를 돌고 승인 대기에서 멈춘다. 5단계는 사람의 approve/reject로만 진행한다.
+
+CLI는 X1부터 workflow.graph(LangGraph)를 쓴다. 이 모듈은 동등성 테스트의 기준과 공용 도우미(new_run, summary)로 남는다.
+"""
 
 import getpass
 import hashlib
@@ -38,26 +41,36 @@ def engine_of(run: dict) -> Engine:
     return get_engine(run["engine"], run["params_path"])
 
 
-def run_workflow(store: RunStore, engine: Engine, *, seed: int, faults: list[str], llm, llm_config: dict,
-                 limits: dict, rehearsal: bool) -> dict:
-    """1 실행 → 2 결과분석 → 3 개선안 도출 → 4 검증 → 승인 대기 (또는 rejected/failed). 최종 run을 돌려준다."""
+def new_run(store: RunStore, engine: Engine, *, seed: int, faults: list[str], llm_model: str, llm_config: dict,
+            limits: dict, rehearsal: bool, orchestrator: str) -> dict:
+    """run.json(재현 정보 + 상태 이력)을 만들어 저장한다. M1 러너와 X1 그래프가 같이 쓴다."""
     params = engine.load_params()
     run = {
         "run_id": store.new_run_id(),
         "created_at": time.time(),
         "status": "running",
         "history": [{"status": "running", "at": time.time(), "note": ""}],
+        "orchestrator": orchestrator,
         "engine": engine.name,
         "params_path": str(engine.params_path.resolve()),
         "params_sha256": params_digest(engine),
         "model_version": model_version(engine, params),
         "scenario": {"seed": seed, "faults": list(faults)},
-        "llm": {"model": llm.model, "rehearsal": rehearsal, "cache": bool(llm_config.get("cache"))},
+        "llm": {"model": llm_model, "rehearsal": rehearsal, "cache": bool(llm_config.get("cache"))},
         "limits": limits,
         "core": core_ref(),
         "error": None,
     }
     store.create(run)
+    return run
+
+
+def run_workflow(store: RunStore, engine: Engine, *, seed: int, faults: list[str], llm, llm_config: dict,
+                 limits: dict, rehearsal: bool) -> dict:
+    """M1 상태 머신 (X1 그래프의 동등성 비교 기준). 1~4단계 → 승인 대기 (또는 rejected/failed)."""
+    params = engine.load_params()
+    run = new_run(store, engine, seed=seed, faults=faults, llm_model=llm.model, llm_config=llm_config,
+                  limits=limits, rehearsal=rehearsal, orchestrator="m1")
     run_id = run["run_id"]
 
     def advance(status: str, note: str = "") -> None:
